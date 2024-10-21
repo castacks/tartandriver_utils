@@ -4,6 +4,50 @@ import torch
 import numpy as np
 import scipy.interpolate, scipy.spatial
 
+def quat_to_yaw(quat):
+    """
+    Convert a quaternion (as [x, y, z, w]) to yaw
+    """
+    return np.arctan2(2 * (quat[3]*quat[2] + quat[0]*quat[1]), 1 - 2 * (quat[1]**2 + quat[2]**2))
+
+def pose_to_htm(pose):
+    """convert a pose (position + quaternion) to a homogeneous transform matrix
+    """
+    p = pose[:3]
+    q = pose[3:7]
+
+    R = scipy.spatial.transform.Rotation.from_quat(q).as_matrix()
+
+    htm = np.eye(4)
+    htm[:3, :3] = R
+    htm[:3, -1] = p
+
+    return htm
+
+def htm_to_pose(htm):
+    """convert a htm (4x4) matrix to a pose (position + quaternion)
+    (quaternion will be [qx, qy, qz, qw])
+    """
+    R = htm[:3, :3]
+    p = htm[:3, -1]
+    q = scipy.spatial.transform.Rotation.from_matrix(R).as_quat(scalar_first=False)
+    pose = np.concatenate([p, q])
+    return pose
+
+def transform_points(points, htm):
+    """transform a set of points using a homogeneous transform matrix
+    Args:
+        points: [P x N] Tensor of points (assuming first three channels are [x,y,z])
+        htm: [4 x 4] transform patrix
+
+    Returns:
+        points: [P x N] Tensor of points where the first three channels have been transformed according to htm (note that this modifies points)
+    """
+    pt_pos = points[:, :3]
+    pt_pos = torch.cat([pt_pos, torch.ones_like(pt_pos[:, [0]])], dim=-1)
+    pt_tf_pos = htm.view(1, 4, 4) @ pt_pos.view(-1, 4, 1)
+    points[:, :3] = pt_tf_pos[:, :3, 0]
+    return points
 class TrajectoryInterpolator:
     """
     Helper class for interpolating trajectories
