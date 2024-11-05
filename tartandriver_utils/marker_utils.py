@@ -99,16 +99,19 @@ class WaypointData:
     total: int = field(init=False)
     places: int = field(init=False)
     numbers: list = field(init=False)
+    radius: int = field(init=False)
 
     def __post_init__(self):
         self._waypoints = self._convert_waypoints(self._waypoints)
         self._update_totals()
         self.numbers = np.arange(self.total).tolist()
+        self.radius = self._waypoints[0].radius if self._waypoints else 4.
 
     def update(self, new_waypoints):
-        if new_waypoints is not None:
+        if new_waypoints:
             self._waypoints = self._convert_waypoints(new_waypoints)
             self._update_totals()
+            self.radius = self._waypoints[0].radius
 
     def _convert_waypoints(
         self, unfmt_waypoints: Union[Waypoint, Mission, PoseArray, list]
@@ -161,7 +164,102 @@ class WaypointData:
         return self._waypoints
 
 
-class MissionVisualizer:
+class MarkerVisualizer:
+    """
+    General utility to visualize all marker data with convenient modularity,
+    easy-to-update configurations, and many visualization helper functions
+    
+    Cannot be used as standalone, but is a base class for all other visualizers
+    """
+    def __init__(self, node: Node, configs):
+        self._node = node
+        self._config = None # placeholder init for when setter called
+        self.config = configs # call setter
+    
+    def update_all_configs(self, key, value):
+        """
+        Update all configs with the same data.
+        Useful for frames, lifetime, etc.
+        """
+        if key in {"config_name", "namespace", "_node", "_initializing"}:
+            self._node.get_logger().warn(f"Cannot change MarkerConfig key:{key}")
+            return
+        new_cfg = {key: value}
+        for cfg in self._config:
+            cfg._update_field(new_cfg, key)
+
+    def _parse_config(self, new_config):
+        configs = []
+        init = False
+        if isinstance(new_config, dict):
+            config = self._config
+            if not config:
+                init = True
+                c = []
+                for cfg_name, _ in new_config.items():
+                    c.append(MarkerConfig(config_name=cfg_name, _node=self._node, _initializing=init))
+                config = c
+            for cfg, [_, new_cfg] in zip(config, new_config.items()):
+                for field in vars(cfg).keys():
+                    cfg._update_field(new_cfg, field)
+                if init:
+                    cfg._initializing = not init
+                configs.append(cfg) 
+        elif isinstance(new_config, list):
+            config = self._config
+            if not config:
+                init = True
+                c = []
+                for _ in range(len(new_config)):
+                    c.append(MarkerConfig(_node=self._node, _initializing=init))
+                config = c    
+            for cfg, new_cfg in zip(config, new_config):
+                for field in vars(cfg).keys():
+                    cfg._update_field(new_cfg, field)
+                if init:
+                    cfg._initializing = not init
+                configs.append(cfg)    
+        else:
+            raise TypeError("Unsupported config type. Expected dict or list[MarkerConfig].")
+
+        return configs
+
+    @property
+    def config(self):
+        return self._config
+
+    @config.setter
+    def config(self, new_configs):
+        if self._config is None:
+            self._config = []
+
+        if isinstance(new_configs, str):
+            self._node.get_logger().info("Loading YAML path config...")
+            assert os.path.exists(new_configs)
+            with open(new_configs, "r") as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                self._config = self._parse_config(config)
+
+        elif isinstance(new_configs, dict):
+            self._node.get_logger().info("Loading dictionary config...")
+            self._config = self._parse_config(new_configs)
+
+        elif isinstance(new_configs, MarkerConfig):
+            self._node.get_logger().info("Loading MarkerConfig...")
+            self._config = self._parse_config([new_configs])
+        
+        elif isinstance(new_configs, list):
+            self._node.get_logger().info(f"Loading {len(new_configs):d} MarkerConfigs...")
+            combined_config = [
+                cfg for cfg in new_configs if isinstance(cfg, MarkerConfig)
+            ]
+            self._config = self._parse_config(combined_config)
+        
+        else:
+            raise TypeError("configs must be a MarkerConfig, list of MarkerConfig, string, or dictionary")
+
+
+class MissionVisualizer(MarkerVisualizer):
     """
     Utility to convert waypoint data to visualized marker messages of
     configured format
@@ -170,8 +268,6 @@ class MissionVisualizer:
                       Dictionary/YAML content)
     :param node: rclpy.node to be used for clock
     :param configs: configurations for marker visualization. Passed as MarkerConfig, list[MarkerConfig], YAML path, Dictionary
-
-    TODO: Can be generalized further for non-waypoint use-cases i.e. MPPI, planning, etc.
     """
 
     def __init__(
@@ -180,11 +276,11 @@ class MissionVisualizer:
         self._node = node
         self._mission_waypoints = WaypointData(waypoints)
         self._waypoints = WaypointData(waypoints)
-        self._config = None  # placeholder init for when setter called
-        self.config = configs
         if self._waypoints is None:
             print("Invalid entry")
             exit(1)
+        
+        super().__init__(self._node, configs)
 
     def to_viz_msg(self) -> Marker:
         """
@@ -303,60 +399,14 @@ class MissionVisualizer:
     def load_mission(self, new_waypoints):
         """
         Load new mission. Acts like waypoints property, but it instead resets
-        internal total waypoints for visualizing numbers
+        internal total waypoints for visualizing numbers. Also, update scale to
+        reflect new radius.
         """
         self._mission_waypoints.total = 0
         if new_waypoints is not None:
             self._mission_waypoints.update(new_waypoints)
+            self.update_all_configs("scale", [self._mission_waypoints.radius] * 3)
             self._node.get_logger().info(f"New mission loaded with {self._mission_waypoints.total} points")
-
-    def update_all_configs(self, key, value):
-        """
-        Update all configs with the same data.
-        Useful for frames, lifetime, etc.
-        """
-        if key in {"config_name", "namespace", "_node", "_initializing"}:
-            self._node.get_logger().warn(f"Cannot change MarkerConfig key:{key}")
-            return
-        new_cfg = {key: value}
-        for cfg in self._config:
-            cfg._update_field(new_cfg, key)
-
-    def _parse_config(self, new_config):
-        configs = []
-        init = False
-        if isinstance(new_config, dict):
-            config = self._config
-            if not config:
-                init = True
-                c = []
-                for cfg_name, _ in new_config.items():
-                    c.append(MarkerConfig(config_name=cfg_name, _node=self._node, _initializing=init))
-                config = c
-            for cfg, [_, new_cfg] in zip(config, new_config.items()):
-                for field in vars(cfg).keys():
-                    cfg._update_field(new_cfg, field)
-                if init:
-                    cfg._initializing = not init
-                configs.append(cfg) 
-        elif isinstance(new_config, list):
-            config = self._config
-            if not config:
-                init = True
-                c = []
-                for _ in range(len(new_config)):
-                    c.append(MarkerConfig(_node=self._node, _initializing=init))
-                config = c    
-            for cfg, new_cfg in zip(config, new_config):
-                for field in vars(cfg).keys():
-                    cfg._update_field(new_cfg, field)
-                if init:
-                    cfg._initializing = not init
-                configs.append(cfg)    
-        else:
-            raise TypeError("Unsupported config type. Expected dict or list[MarkerConfig].")
-
-        return configs
 
     def _trim_points_in_view(
         self, var_wpts: WaypointData, points_in_view: int, fade_past: bool
@@ -364,7 +414,16 @@ class MissionVisualizer:
         """
         Trim waypoints to only show the ones in view
         """
-        if points_in_view < self._mission_waypoints.total:
+        # Set reference total based on presence of mission_waypoints.
+        # If no mission_waypoints, then this is a generator, and we just use
+        # regular waypoints instead.
+        if self._mission_waypoints.waypoints:
+            waypoints_total = self._mission_waypoints.total
+        else:
+            waypoints_total = self._waypoints.total
+
+        # Trim
+        if points_in_view < waypoints_total:
             if fade_past:
                 var_wpts.update(var_wpts.waypoints[:points_in_view])
                 var_wpts.numbers = var_wpts.numbers[:points_in_view]
@@ -396,47 +455,13 @@ class MissionVisualizer:
             var_wpts.numbers = viz_numbers
 
     @property
-    def config(self):
-        return self._config
-
-    @config.setter
-    def config(self, new_configs):
-        if self._config is None:
-            self._config = []
-
-        if isinstance(new_configs, str):
-            self._node.get_logger().info("Loading YAML path config...")
-            assert os.path.exists(new_configs)
-            with open(new_configs, "r") as f:
-                config = yaml.load(f, Loader=yaml.FullLoader)
-                self._config = self._parse_config(config)
-
-        elif isinstance(new_configs, dict):
-            self._node.get_logger().info("Loading dictionary config...")
-            self._config = self._parse_config(new_configs)
-
-        elif isinstance(new_configs, MarkerConfig):
-            self._node.get_logger().info("Loading MarkerConfig...")
-            self._config = self._parse_config([new_configs])
-        
-        elif isinstance(new_configs, list):
-            self._node.get_logger().info(f"Loading {len(new_configs):d} MarkerConfigs...")
-            combined_config = [
-                cfg for cfg in new_configs if isinstance(cfg, MarkerConfig)
-            ]
-            self._config = self._parse_config(combined_config)
-        
-        else:
-            raise TypeError("configs must be a MarkerConfig, list of MarkerConfig, string, or dictionary")
-
-    @property
-    def config_names(self):
-        return [cfg.config_name for cfg in self._config]
-
-    @property
     def waypoints(self):
         return self._waypoints.waypoints
 
     @waypoints.setter
     def waypoints(self, new_waypoints):
         self._waypoints.update(new_waypoints)
+
+    @property
+    def waypoint_data(self):
+        return self._waypoints
