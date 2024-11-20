@@ -9,7 +9,7 @@ import os
 from tartandriver_utils.ros_utils import waypoint_dict_to_msg, waypoint_pose_to_msg
 
 from rclpy.node import Node
-from rclpy.time import Duration
+from rclpy.time import Time, Duration
 
 from std_msgs.msg import ColorRGBA
 from geometry_msgs.msg import Vector3, Pose, PoseArray
@@ -79,19 +79,52 @@ class MarkerConfig:
         setattr(self, key, new_data)
 
     def __setattr__(self, key, value):
+        """
+        Overloaded attribute setter with conversion utility and logger utility
+        """
+        # If no node, can do no logging. Set attribute first.
         if not self._node:
-            pass
+            super().__setattr__(key, value)
+            return
+        
+        # Set default update format
+        fmt=None
+
+        # Key specific checks
+        if key == "lifetime":
+            value = self._convert_lifetime(value)
+            fmt='.2e'
         elif key in {"config_name", "_initializing", "_node"}:
-            pass
-        elif hasattr(self, "_initializing") and self._initializing:
-            # Only show "Set" messages during initialization
-            self._node.get_logger().info(f"Set {self.config_name} {key}={value}")
+            # Skip special logging for these attributes
+            super().__setattr__(key, value)
+            return
+
+        # Apply logging for all other keys
+        if hasattr(self, "_initializing") and self._initializing:
+            # Log "Set" messages during initialization
+            if fmt:
+                self._node.get_logger().info(f"Set {self.config_name} {key}={value:{fmt}}")
+            else:
+                self._node.get_logger().info(f"Set {self.config_name} {key}={value}")
         else:
-            # For post-initialization updates, show "Updated" messages
+            # Log "Updated" messages for post-initialization changes
             if hasattr(self, key) and getattr(self, key) != value:
-                self._node.get_logger().info(f"Updated {self.config_name} {key}={value}")
+                if fmt:
+                    self._node.get_logger().info(f"Updated {self.config_name} {key}={value:{fmt}}")
+                else:
+                    self._node.get_logger().info(f"Updated {self.config_name} {key}={value}")
+        
         super().__setattr__(key, value)
 
+    def _convert_lifetime(self, time: Union[Time, Duration, float]):
+        """
+        Helper function to accept multiple types of lifetime inputs and convert to nanoseconds
+        """
+        if isinstance(time, Time) or isinstance(time, Duration):
+            self._node.get_logger().info("Received Time object")
+            return time.nanoseconds
+        self._node.get_logger().info("Received float object")
+        return time
 
 @dataclass
 class WaypointData:
