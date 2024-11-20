@@ -5,6 +5,7 @@ from typing import Union
 import copy
 import yaml
 import os
+import matplotlib as mpl
 
 from tartandriver_utils.ros_utils import waypoint_dict_to_msg, waypoint_pose_to_msg
 
@@ -28,6 +29,8 @@ class MarkerConfig:
     object.
 
     :param {marker_fields}: Default marker fields found in Marker() Message
+    :param rgb_start: Start RGB color for color gradient
+    :param rgb_end: End RGB color for color gradient
     :param points_in_view: How many marker points to display (for trajectories)
     :param fade_alpha: Whether or not to fade points away
     :param fade_past: Whether to fade past points or fade upcoming points
@@ -46,12 +49,17 @@ class MarkerConfig:
     type: int = Marker.SPHERE
     scale: list = field(default_factory=lambda: [1.0, 1.0, 1.0])
     rgb: list = field(default_factory=lambda: [0.0, 1.0, 1.0])
+    colors: list = field(default_factory=lambda: [])
     alpha: float = 1.0
     lifetime: float = -1.0
     frame_locked: bool = True
     label: string = ""
 
     ## Custom fields
+    # Color gradient
+    rgb_start: list = field(default_factory=lambda: [])
+    rgb_end: list = field(default_factory=lambda: [])
+
     # Marker fade
     points_in_view: int = 10
     fade_alpha: bool = True
@@ -64,12 +72,13 @@ class MarkerConfig:
     lag_numbers_mode: bool = False
 
     # Point aesthetic
-    core_mode: bool = True
+    core_mode: bool = False
     blink_mode: bool = False
 
     # Interal storage
     _node: Node = None
     _initializing: bool = False
+    _quiet: bool = False
 
     def _update_field(self, new_config, key: str):
         """
@@ -100,7 +109,7 @@ class MarkerConfig:
         fmt=None
 
         # Key specific checks
-        if key in {"config_name", "_initializing", "_node"}:
+        if key in {"config_name", "_initializing", "_node", "_quiet"}:
             # Skip special logging for these attributes
             super().__setattr__(key, value)
             return
@@ -108,20 +117,22 @@ class MarkerConfig:
             value = self._convert_lifetime(value)
             fmt='.2e'
 
+
         # Apply logging for all other keys
-        if hasattr(self, "_initializing") and self._initializing:
-            # Log "Set" messages during initialization
-            if fmt:
-                self._node.get_logger().info(f"Set {self.config_name} {key}={value:{fmt}}")
-            else:
-                self._node.get_logger().info(f"Set {self.config_name} {key}={value}")
-        else:
-            # Log "Updated" messages for post-initialization changes
-            if hasattr(self, key) and getattr(self, key) != value:
+        if not self._quiet:
+            if hasattr(self, "_initializing") and self._initializing:
+                # Log "Set" messages during initialization
                 if fmt:
-                    self._node.get_logger().info(f"Updated {self.config_name} {key}={value:{fmt}}")
+                    self._node.get_logger().info(f"Set {self.config_name} {key}={value:{fmt}}")
                 else:
-                    self._node.get_logger().info(f"Updated {self.config_name} {key}={value}")
+                    self._node.get_logger().info(f"Set {self.config_name} {key}={value}")
+            else:
+                # Log "Updated" messages for post-initialization changes
+                if hasattr(self, key) and getattr(self, key) != value:
+                    if fmt:
+                        self._node.get_logger().info(f"Updated {self.config_name} {key}={value:{fmt}}")
+                    else:
+                        self._node.get_logger().info(f"Updated {self.config_name} {key}={value}")
         
         super().__setattr__(key, value)
 
@@ -139,6 +150,36 @@ class MarkerConfig:
             converted_time /= 2
 
         return converted_time
+
+    def _make_color_gradient(self, size: int, c0=None, c1=None):
+        """
+        Update colors to be a color gradient
+        """
+        # Redundancy check
+        if self.colors and c0 == self.colors[0] and c1 == self.colors[-1]:
+            return
+        # No start or end but requesting gradient
+        if not self.rgb_start and not self.rgb_end:
+            self._quiet = True
+            self.rgb_start = self.rgb
+            self.rgb_end = self.rgb
+            self._quiet = False
+        # Same start and end
+        if self.rgb_start == self.rgb_end:
+            self._quiet = True
+            self.colors = [self.rgb] * (size)
+            self._quiet = False
+            return
+        # Override
+        if c0 and c1:
+            self.rgb_start = c0
+            self.rgb_end = c1
+        
+        colors = []
+        for c in range(size):
+            colors.append([(1 - c / (size-1)) * self.rgb_start[i] + (c / (size-1)) * self.rgb_end[i] for i in range(3)])
+        self.colors = colors
+        return
 
 @dataclass
 class WaypointData:
@@ -234,7 +275,7 @@ class MarkerVisualizer:
         new_cfg = {key: value}
         for cfg in self._config:
             cfg._update_field(new_cfg, key)
-
+    
     def _parse_config(self, new_config):
         configs = []
         init = False
@@ -354,9 +395,12 @@ class MissionVisualizer(MarkerVisualizer):
                     viz_waypoints, config.alpha, config.fade_alpha, config.fade_past
                 )
 
+                # Colors
+                colors = self._set_colors(config, viz_waypoints.total)
+
                 # Create marker
-                for wpt, i, alpha in zip(
-                    viz_waypoints.waypoints, viz_waypoints.numbers, alphas
+                for wpt, i, color, alpha in zip(
+                    viz_waypoints.waypoints, viz_waypoints.numbers, colors, alphas
                 ):
                     marker = Marker()
                     marker.header.stamp = self._node.get_clock().now().to_msg()
@@ -389,9 +433,9 @@ class MissionVisualizer(MarkerVisualizer):
                     marker.scale = wpt_scale
 
                     wpt_color = ColorRGBA()
-                    wpt_color.r = config.rgb[0]
-                    wpt_color.g = config.rgb[1]
-                    wpt_color.b = config.rgb[2]
+                    wpt_color.r = color[0]
+                    wpt_color.g = color[1]
+                    wpt_color.b = color[2]
                     wpt_color.a = alpha
                     marker.color = wpt_color
 
@@ -429,9 +473,9 @@ class MissionVisualizer(MarkerVisualizer):
                         shell_marker.scale = wpt_scale
 
                         wpt_color = ColorRGBA()
-                        wpt_color.r = config.rgb[0]
-                        wpt_color.g = config.rgb[1]
-                        wpt_color.b = config.rgb[2]
+                        wpt_color.r = color[0]
+                        wpt_color.g = color[1]
+                        wpt_color.b = color[2]
                         wpt_color.a = alpha / 4
                         shell_marker.color = wpt_color
 
@@ -477,6 +521,10 @@ class MissionVisualizer(MarkerVisualizer):
             else:
                 var_wpts.update(var_wpts.waypoints[-points_in_view:])
                 var_wpts.numbers = var_wpts.numbers[-points_in_view:]
+
+    def _set_colors(self, cfg: MarkerConfig, size: int):
+        cfg._make_color_gradient(size)
+        return cfg.colors
 
     def _set_alphas(
         self, var_wpts: WaypointData, alpha: float, fade_alpha: bool, fade_past: bool
