@@ -26,6 +26,15 @@ class MarkerConfig:
 
     Useful for setting configuraiton for Marker without creating Marker
     object.
+
+    :param {marker_fields}: Default marker fields found in Marker() Message
+    :param points_in_view: How many marker points to display (for trajectories)
+    :param fade_alpha: Whether or not to fade points away
+    :param fade_past: Whether to fade past points or fade upcoming points
+    :param z_offset: The z-offset for text
+    :param lag_numbers_mode: Display number text as robot lags waypoints
+    :param core_mode: Display marker sphere (core) with transparent outer shell for showing waypoint radius
+    :param blink_mode: Blink marker at twice frequency from presently set lifetime
     """
     # ID
     config_name: string = ""
@@ -43,20 +52,20 @@ class MarkerConfig:
     label: string = ""
 
     ## Custom fields
-    # Numbering
-    selection_mode: bool = False  # if vizing a selected mission vs generating mission
-
-    # Waypoint fade
-    points_in_view: int = 10  # how many points to display
-    fade_alpha: bool = True  # whether or not to fade the points away
-    fade_past: bool = True  # whether to fade past points or fade upcoming points
+    # Marker fade
+    points_in_view: int = 10
+    fade_alpha: bool = True
+    fade_past: bool = True
 
     # Text
-    z_offset: float = 0.0  # z offset for text
+    z_offset: float = 0.0
+
+    # Numbering
+    lag_numbers_mode: bool = False
 
     # Point aesthetic
-    core_mode: bool = True  # display waypoint sphere with transparent outer shell for
-    # showing wayoint radius
+    core_mode: bool = True
+    blink_mode: bool = False
 
     # Interal storage
     _node: Node = None
@@ -91,13 +100,13 @@ class MarkerConfig:
         fmt=None
 
         # Key specific checks
-        if key == "lifetime":
-            value = self._convert_lifetime(value)
-            fmt='.2e'
-        elif key in {"config_name", "_initializing", "_node"}:
+        if key in {"config_name", "_initializing", "_node"}:
             # Skip special logging for these attributes
             super().__setattr__(key, value)
             return
+        elif key == "lifetime":
+            value = self._convert_lifetime(value)
+            fmt='.2e'
 
         # Apply logging for all other keys
         if hasattr(self, "_initializing") and self._initializing:
@@ -120,11 +129,16 @@ class MarkerConfig:
         """
         Helper function to accept multiple types of lifetime inputs and convert to nanoseconds
         """
+        converted_time = None
         if isinstance(time, Time) or isinstance(time, Duration):
-            self._node.get_logger().info("Received Time object")
-            return time.nanoseconds
-        self._node.get_logger().info("Received float object")
-        return time
+            converted_time = time.nanoseconds
+        else:
+            converted_time = time
+
+        if self.blink_mode:
+            converted_time /= 2
+
+        return converted_time
 
 @dataclass
 class WaypointData:
@@ -262,7 +276,7 @@ class MarkerVisualizer:
         return self._config
 
     @config.setter
-    def config(self, new_configs):
+    def config(self, new_configs: Union[str, dict, MarkerConfig, list]):
         if self._config is None:
             self._config = []
 
@@ -328,7 +342,7 @@ class MissionVisualizer(MarkerVisualizer):
                 viz_waypoints = copy.deepcopy(self._waypoints)
 
                 # Numbering
-                self._number_waypoints(viz_waypoints, config.selection_mode)
+                self._number_waypoints(viz_waypoints, config.lag_numbers_mode)
 
                 # Trim
                 self._trim_points_in_view(
@@ -478,10 +492,10 @@ class MissionVisualizer(MarkerVisualizer):
         return np.array(alphas)
 
     def _number_waypoints(
-        self, var_wpts: WaypointData, selection_mode: bool
+        self, var_wpts: WaypointData, lag_numbers_mode: bool
     ) -> np.ndarray:
         viz_numbers = np.arange(var_wpts.total).tolist()
-        if selection_mode:
+        if lag_numbers_mode:
             passed_points = self._mission_waypoints.total - var_wpts.total
             var_wpts.numbers = [int(v + passed_points) for v in viz_numbers]
         else:
