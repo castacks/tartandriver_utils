@@ -105,36 +105,43 @@ class MarkerConfig:
             super().__setattr__(key, value)
             return
         
-        # Set default update format
-        fmt=None
-
-        # Key specific checks
+        # Key specific checks with custom logging
         if key in {"config_name", "_initializing", "_node", "_quiet"}:
             # Skip special logging for these attributes
             super().__setattr__(key, value)
-            return
+        elif key == "colors":
+            self._update_logger(key, value, show_value=False)
+            super().__setattr__(key, value)
         elif key == "lifetime":
             value = self._convert_lifetime(value)
-            fmt='.2e'
+            self._update_logger(key, value, fmt='.2e')
+            super().__setattr__(key, value)
+        else:
+            # Apply logging for all other keys
+            self._update_logger(key, value)
+            super().__setattr__(key, value)
 
-
-        # Apply logging for all other keys
+    def _update_logger(self, key, value=None, fmt=None, show_value=True,):
+        """
+        Helper function for config parameter updates and sets
+        """
+        log_msg = f"{self.config_name} {key}"
         if not self._quiet:
+            # State what key being set/updated to
+            if value is not None and show_value:
+                if fmt:
+                    log_msg = log_msg + f"={value:{fmt}}"
+                else:
+                    log_msg = log_msg + f"={value}"
+            
             if hasattr(self, "_initializing") and self._initializing:
                 # Log "Set" messages during initialization
-                if fmt:
-                    self._node.get_logger().info(f"Set {self.config_name} {key}={value:{fmt}}")
-                else:
-                    self._node.get_logger().info(f"Set {self.config_name} {key}={value}")
-            else:
+                log_msg = "Set " + log_msg
+                self._node.get_logger().info(log_msg)
+            elif hasattr(self, key) and getattr(self, key) != value:
                 # Log "Updated" messages for post-initialization changes
-                if hasattr(self, key) and getattr(self, key) != value:
-                    if fmt:
-                        self._node.get_logger().info(f"Updated {self.config_name} {key}={value:{fmt}}")
-                    else:
-                        self._node.get_logger().info(f"Updated {self.config_name} {key}={value}")
-        
-        super().__setattr__(key, value)
+                log_msg = "Updated " + log_msg
+                self._node.get_logger().info(log_msg)
 
     def _convert_lifetime(self, time: Union[Time, Duration, float]):
         """
@@ -160,7 +167,7 @@ class MarkerConfig:
             return
         # No start or end but requesting gradient
         if not self.rgb_start and not self.rgb_end:
-            self._quiet = True
+            self._quiet = True # janky hack mate
             self.rgb_start = self.rgb
             self.rgb_end = self.rgb
             self._quiet = False
@@ -345,218 +352,3 @@ class MarkerVisualizer:
         
         else:
             raise TypeError("configs must be a MarkerConfig, list of MarkerConfig, string, or dictionary")
-
-
-class MissionVisualizer(MarkerVisualizer):
-    """
-    Utility to convert waypoint data to visualized marker messages of
-    configured format
-
-    :param waypoints: waypoint data (in form of Waypoint, Mission, or
-                      Dictionary/YAML content)
-    :param node: rclpy.node to be used for clock
-    :param configs: configurations for marker visualization. Passed as MarkerConfig, list[MarkerConfig], YAML path, Dictionary
-    """
-
-    def __init__(
-        self, waypoints, node: Node, configs
-    ):
-        self._node = node
-        self._mission_waypoints = WaypointData(waypoints)
-        self._waypoints = WaypointData(waypoints)
-        if self._waypoints is None:
-            print("Invalid entry")
-            exit(1)
-        
-        super().__init__(self._node, configs)
-
-    def to_viz_msg(self) -> Marker:
-        """
-        Convert waypoints to marker message type for visualization
-
-        :param config: pseudo 'struct' for Marker configuration
-        """
-        markers = MarkerArray()
-
-        if self._config is not None:
-            for config in self._config:
-                viz_waypoints = copy.deepcopy(self._waypoints)
-
-                # Numbering
-                self._number_waypoints(viz_waypoints, config.lag_numbers_mode)
-
-                # Trim
-                self._trim_points_in_view(
-                    viz_waypoints, config.points_in_view, config.fade_past
-                )
-
-                # Fading waypoints
-                alphas = self._set_alphas(
-                    viz_waypoints, config.alpha, config.fade_alpha, config.fade_past
-                )
-
-                # Colors
-                colors = self._set_colors(config, viz_waypoints.total)
-
-                # Create marker
-                for wpt, i, color, alpha in zip(
-                    viz_waypoints.waypoints, viz_waypoints.numbers, colors, alphas
-                ):
-                    marker = Marker()
-                    marker.header.stamp = self._node.get_clock().now().to_msg()
-                    marker.header.frame_id = config.frame_id
-                    marker.ns = (
-                        config.namespace
-                    )  # Must have unique namespaces, otherwise overwriting
-                    if config.type == Marker.TEXT_VIEW_FACING:
-                        marker.id = i + 2 * viz_waypoints.total
-                    else:
-                        marker.id = i
-                    marker.type = config.type
-                    marker.action = Marker.ADD
-
-                    wpt_pose = Pose()
-                    wpt_pose.position.x = wpt.position.x
-                    wpt_pose.position.y = wpt.position.y
-                    wpt_pose.position.z = wpt.position.z + config.z_offset
-                    marker.pose = wpt_pose
-
-                    wpt_scale = Vector3()
-                    wpt_scale.x = config.scale[0]
-                    wpt_scale.y = config.scale[1]
-                    wpt_scale.z = config.scale[2]
-                    if config.core_mode:
-                        # Turn marker into more opaque core
-                        wpt_scale.x = config.scale[0] / 4
-                        wpt_scale.y = config.scale[1] / 4
-                        wpt_scale.z = config.scale[2] / 4
-                    marker.scale = wpt_scale
-
-                    wpt_color = ColorRGBA()
-                    wpt_color.r = color[0]
-                    wpt_color.g = color[1]
-                    wpt_color.b = color[2]
-                    wpt_color.a = alpha
-                    marker.color = wpt_color
-
-                    marker.lifetime = Duration(nanoseconds=config.lifetime).to_msg()
-                    marker.frame_locked = config.frame_locked
-
-                    if config.label and marker.type == Marker.TEXT_VIEW_FACING:
-                        marker.text = f"{config.label}_{i:0{viz_waypoints.places}d}"
-
-                    markers.markers.append(marker)
-                    shell_marker = Marker()
-                    if config.core_mode and not marker.type == Marker.TEXT_VIEW_FACING:
-                        shell_marker.header.stamp = (
-                            self._node.get_clock().now().to_msg()
-                        )
-                        shell_marker.header.frame_id = config.frame_id
-                        shell_marker.ns = (
-                            config.namespace + "_shell"
-                        )  # Must have unique namespaces, otherwise overwriting
-                        shell_marker.id = i + viz_waypoints.total
-                        shell_marker.type = config.type
-                        shell_marker.action = Marker.ADD
-
-                        wpt_pose = Pose()
-                        wpt_pose.position.x = wpt.position.x
-                        wpt_pose.position.y = wpt.position.y
-                        wpt_pose.position.z = wpt.position.z + config.z_offset
-                        shell_marker.pose = wpt_pose
-
-                        wpt_scale = Vector3()
-                        # Turn shell_marker into more transparent shell
-                        wpt_scale.x = config.scale[0]
-                        wpt_scale.y = config.scale[1]
-                        wpt_scale.z = config.scale[2]
-                        shell_marker.scale = wpt_scale
-
-                        wpt_color = ColorRGBA()
-                        wpt_color.r = color[0]
-                        wpt_color.g = color[1]
-                        wpt_color.b = color[2]
-                        wpt_color.a = alpha / 4
-                        shell_marker.color = wpt_color
-
-                        shell_marker.lifetime = Duration(
-                            nanoseconds=config.lifetime
-                        ).to_msg()
-                        shell_marker.frame_locked = config.frame_locked
-
-                        markers.markers.append(shell_marker)
-        return markers
-
-    def load_mission(self, new_waypoints):
-        """
-        Load new mission. Acts like waypoints property, but it instead resets
-        internal total waypoints for visualizing numbers. Also, update scale to
-        reflect new radius.
-        """
-        self._mission_waypoints.total = 0
-        if new_waypoints is not None:
-            self._mission_waypoints.update(new_waypoints)
-            self.update_all_configs("scale", [self._mission_waypoints.radius] * 3)
-            self._node.get_logger().info(f"New mission loaded with {self._mission_waypoints.total} points")
-
-    def _trim_points_in_view(
-        self, var_wpts: WaypointData, points_in_view: int, fade_past: bool
-    ) -> np.ndarray:
-        """
-        Trim waypoints to only show the ones in view
-        """
-        # Set reference total based on presence of mission_waypoints.
-        # If no mission_waypoints, then this is a generator, and we just use
-        # regular waypoints instead.
-        if self._mission_waypoints.waypoints:
-            waypoints_total = self._mission_waypoints.total
-        else:
-            waypoints_total = self._waypoints.total
-
-        # Trim
-        if points_in_view < waypoints_total:
-            if fade_past:
-                var_wpts.update(var_wpts.waypoints[:points_in_view])
-                var_wpts.numbers = var_wpts.numbers[:points_in_view]
-            else:
-                var_wpts.update(var_wpts.waypoints[-points_in_view:])
-                var_wpts.numbers = var_wpts.numbers[-points_in_view:]
-
-    def _set_colors(self, cfg: MarkerConfig, size: int):
-        cfg._make_color_gradient(size)
-        return cfg.colors
-
-    def _set_alphas(
-        self, var_wpts: WaypointData, alpha: float, fade_alpha: bool, fade_past: bool
-    ) -> np.ndarray:
-        if fade_alpha:
-            if fade_past:
-                alphas = (np.linspace(alpha, 0, var_wpts.total + 1) ** 2).tolist()
-            else:
-                alphas = (np.linspace(0, alpha, var_wpts.total + 1) ** 2).tolist()
-                alphas = alphas[1:]
-        else:
-            alphas = [alpha] * var_wpts.total
-        return np.array(alphas)
-
-    def _number_waypoints(
-        self, var_wpts: WaypointData, lag_numbers_mode: bool
-    ) -> np.ndarray:
-        viz_numbers = np.arange(var_wpts.total).tolist()
-        if lag_numbers_mode:
-            passed_points = self._mission_waypoints.total - var_wpts.total
-            var_wpts.numbers = [int(v + passed_points) for v in viz_numbers]
-        else:
-            var_wpts.numbers = viz_numbers
-
-    @property
-    def waypoints(self):
-        return self._waypoints.waypoints
-
-    @waypoints.setter
-    def waypoints(self, new_waypoints):
-        self._waypoints.update(new_waypoints)
-
-    @property
-    def waypoint_data(self):
-        return self._waypoints
