@@ -2,19 +2,16 @@ import numpy as np
 from dataclasses import dataclass, field
 import string
 from typing import Union
-import copy
 import yaml
 import os
-import matplotlib as mpl
 
 from tartandriver_utils.ros_utils import waypoint_dict_to_msg, waypoint_pose_to_msg
 
 from rclpy.node import Node
 from rclpy.time import Time, Duration
 
-from std_msgs.msg import ColorRGBA
-from geometry_msgs.msg import Vector3, Pose, PoseArray
-from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import PoseArray
+from visualization_msgs.msg import Marker
 
 from core_interfaces.msg import Waypoint, Mission
 
