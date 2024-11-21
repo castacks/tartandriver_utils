@@ -102,21 +102,22 @@ class MarkerConfig:
             super().__setattr__(key, value)
             return
         
-        # Key specific checks with custom logging
+        # Key specific checks with necessary conversions and custom logging
         if key in {"config_name", "_initializing", "_node", "_quiet"}:
             # Skip special logging for these attributes
             super().__setattr__(key, value)
+        elif key in {"rgb", "rgb_start", "rgb_end"}:
+            value = self._convert_rgb(value)
+            self._update_logger(key, value)
         elif key == "colors":
             self._update_logger(key, value, show_value=False)
-            super().__setattr__(key, value)
         elif key == "lifetime":
             value = self._convert_lifetime(value)
             self._update_logger(key, value, fmt='.2e')
-            super().__setattr__(key, value)
         else:
             # Apply logging for all other keys
             self._update_logger(key, value)
-            super().__setattr__(key, value)
+        super().__setattr__(key, value)
 
     def _update_logger(self, key, value=None, fmt=None, show_value=True,):
         """
@@ -154,6 +155,17 @@ class MarkerConfig:
             converted_time /= 2
 
         return converted_time
+    
+    def _convert_rgb(self, rgb):
+        """
+        Helper function to accept multiple types of rgb inputs and convert to float list
+        """
+        if any(isinstance(c, int) for c in rgb):
+            rgb = [float(c) for c in rgb]
+        if rgb and not any(isinstance(c, float) for c in rgb):
+            self._node.get_logger().error("Invalid RGB entry")
+
+        return rgb
 
     def _make_color_gradient(self, size: int, c0=None, c1=None):
         """
@@ -172,6 +184,12 @@ class MarkerConfig:
         if self.rgb_start == self.rgb_end:
             self._quiet = True
             self.colors = [self.rgb] * (size)
+            self._quiet = False
+            return
+        # Only 1 point in data
+        if size <= 1:
+            self._quiet = True
+            self.colors = [self.rgb_start]
             self._quiet = False
             return
         # Override
