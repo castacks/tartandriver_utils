@@ -8,7 +8,7 @@ from std_msgs.msg import ColorRGBA
 from geometry_msgs.msg import Vector3, Pose
 from visualization_msgs.msg import Marker, MarkerArray
 
-from tartandriver_utils import WaypointData, MarkerVisualizer, MarkerConfig
+from tartandriver_utils.marker_utils import WaypointData, MarkerVisualizer, MarkerConfig
 
 class MissionVisualizer(MarkerVisualizer):
     """
