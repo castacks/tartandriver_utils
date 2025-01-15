@@ -1,0 +1,13 @@
+<robot name="AV21">
+
+
+  <link name="vehicle_viz">
+    <visual>
+      <geometry>
+        <mesh filename="file:///home/tartandriver/tartandriver_ws/src/core/tartandriver_utils/atv_mesh/textured.obj" />
+      </geometry>
+    </visual>
+  </link>
+
+
+</robot>
