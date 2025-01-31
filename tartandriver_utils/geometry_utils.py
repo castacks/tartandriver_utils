@@ -30,7 +30,7 @@ def htm_to_pose(htm):
     """
     R = htm[:3, :3]
     p = htm[:3, -1]
-    q = scipy.spatial.transform.Rotation.from_matrix(R).as_quat(scalar_first=False)
+    q = scipy.spatial.transform.Rotation.from_matrix(R).as_quat()
     pose = np.concatenate([p, q])
     return pose
 
