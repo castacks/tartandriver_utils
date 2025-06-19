@@ -58,9 +58,16 @@ class MultiDimensionalInterpolator:
     Expects either a N-element trajectory as: [T x N], where N is an arbitrary
     dimension timeseries. This could be an odometry trajectory, command list, etc.
 
-    funtionally, works identically to the scipy interpolation object
+    Funtionally, this works identically to the scipy interpolation object.
+    This interpolator can handle torch or numpy inputs and returns the same
+    type as the input.
     """
-    def __init__(self, times, traj, rot_mask=None, tol=1e-1, interp_kwargs={}):
+    def __init__(self,
+                 times: np.ndarray | torch.Tensor,
+                 traj: np.ndarray | torch.Tensor,
+                 rot_mask: np.ndarray | torch.Tensor=None,
+                 tol: float=1e-1,
+                 interp_kwargs={}):
         """
         Args:
             traj: the traj to interpolate (of shape [T x N])
@@ -71,6 +78,18 @@ class MultiDimensionalInterpolator:
                       order: qx, qy, qz, qw
             tol: the amount of allowable extrapolation
         """
+        # Format into np. Assuming if traj is torch, then output should be torch.
+        if isinstance(times, torch.Tensor):
+            times = times.cpu().numpy()
+        if isinstance(rot_mask, torch.Tensor):
+            rot_mask = rot_mask.cpu().numpy()
+        if isinstance(traj, torch.Tensor):
+            self._torch_types = True
+            self._device = traj.device
+            traj = traj.cpu().numpy()
+        else:
+            self._torch_types = False
+
         # Set defauls and reshape traj if only 1D
         if len(traj.shape) == 1:
             traj = traj.reshape(traj.shape[0], 1)
@@ -120,6 +139,8 @@ class MultiDimensionalInterpolator:
         Args:
             qtimes: the set of times to query
         """
+        if isinstance(qtimes, torch.Tensor):
+            qtimes = qtimes.cpu().numpy()
         interp = np.stack([itrp(qtimes) for itrp in self._interps])
         self._traj_interp[~self._rot_mask] = interp
 
@@ -127,19 +148,33 @@ class MultiDimensionalInterpolator:
             rot_interp = self._rot_interp(qtimes).as_quat()
             self._traj_interp[self._rot_mask] = rot_interp
 
-        return self._traj_interp
+        if self._torch_types:
+            return torch.from_numpy(self._traj_interp)
+        else:
+            return self._traj_interp
 
 
 class TrajectoryInterpolator(MultiDimensionalInterpolator):
     """
     Helper class for interpolating generic timeseries
-    Expects either a 13-element trajectory as: [T x 13], for
+    Expects either a 7 or 13-element trajectory as: [T x {7,13}], for
     interpolating odometry trajectories of [x y z qx qy qz qw vx vy vz wx wy wz]
+    or pose trajectores of [x y z qx qy qz qw]
 
     funtionally, works identically to the scipy interpolation object
     """
-    def __init__(self, times, traj, tol, interp_kwargs={}):
-        super().__init__(times, traj, ODOM_MASK, tol, interp_kwargs)
+    def __init__(self,
+                 times: np.ndarray | torch.Tensor,
+                 traj: np.ndarray | torch.Tensor,
+                 tol: float=1e-1,
+                 interp_kwargs={}):
+        
+        assert len(traj.shape) == 2, 'Expected traj of shape [T x {7,13}], got {}'.format(traj.shape)
+        if traj.shape[-1] == 7:
+            mask = POSE_MASK
+        elif traj.shape[-1] == 13:
+            mask = ODOM_MASK
+        super().__init__(times, traj, mask, tol, interp_kwargs)
     
     def __call__(self, qtimes):
         """
