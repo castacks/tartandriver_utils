@@ -55,7 +55,7 @@ def transform_points(points, htm):
 class MultiDimensionalInterpolator:
     """
     Helper class for interpolating generic timeseries
-    Expects either a 7-element trajectory as: [T x N], where N is an arbitrary
+    Expects either a N-element trajectory as: [T x N], where N is an arbitrary
     dimension timeseries. This could be an odometry trajectory, command list, etc.
 
     funtionally, works identically to the scipy interpolation object
@@ -71,8 +71,12 @@ class MultiDimensionalInterpolator:
                       order: qx, qy, qz, qw
             tol: the amount of allowable extrapolation
         """
+        # Set defauls and reshape traj if only 1D
+        if len(traj.shape) == 1:
+            traj = traj.reshape(traj.shape[0], 1)
         if rot_mask is None:
             rot_mask = np.zeros(traj.shape[-1], dtype=bool)
+
         assert len(traj.shape) == 2, 'Expected traj of shape [T x N], got {}'.format(traj.shape)
         assert traj.shape[-1] == rot_mask.shape[0], 'Rotation mask dimension must match traj N={}'.format(traj.shape[-1])
         assert times.shape[0] == traj.shape[0], 'Got {} times, but {} steps in traj'.format(times.shape[0], traj.shape[0])
@@ -102,6 +106,14 @@ class MultiDimensionalInterpolator:
             rots = scipy.spatial.transform.Rotation.from_quat(traj[:, self._rot_mask])
             self._rot_interp = scipy.spatial.transform.Slerp(times[idxs], rots[idxs], **interp_kwargs)
 
+    def __call__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        return self[qtimes]
+
     def __getitem__(self, qtimes):
         """
         Interpolate the traj according to qtimes.
@@ -116,6 +128,35 @@ class MultiDimensionalInterpolator:
             self._traj_interp[self._rot_mask] = rot_interp
 
         return self._traj_interp
+
+
+class TrajectoryInterpolator(MultiDimensionalInterpolator):
+    """
+    Helper class for interpolating generic timeseries
+    Expects either a 13-element trajectory as: [T x 13], for
+    interpolating odometry trajectories of [x y z qx qy qz qw vx vy vz wx wy wz]
+
+    funtionally, works identically to the scipy interpolation object
+    """
+    def __init__(self, times, traj, tol, interp_kwargs={}):
+        super().__init__(times, traj, ODOM_MASK, tol, interp_kwargs)
+    
+    def __call__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        return super().__call__(qtimes)
+
+    def __getitem__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        return super().__getitem__(qtimes)
+
 
 def make_footprint(length, width, nl, nw, length_offset, width_offset, device='cpu'):
     xs = torch.linspace(-length/2., length/2., nl, device=device) + length_offset
