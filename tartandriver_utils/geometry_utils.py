@@ -4,6 +4,9 @@ import torch
 import numpy as np
 import scipy.interpolate, scipy.spatial
 
+ODOM_MASK = np.asarray([0,0,0,1,1,1,1,0,0,0,0,0,0], dtype=bool)
+POSE_MASK = np.asarray([0,0,0,1,1,1,1], dtype=bool)
+
 def quat_to_yaw(quat):
     """
     Convert a quaternion (as [x, y, z, w]) to yaw
@@ -48,52 +51,79 @@ def transform_points(points, htm):
     pt_tf_pos = htm.view(1, 4, 4) @ pt_pos.view(-1, 4, 1)
     points[:, :3] = pt_tf_pos[:, :3, 0]
     return points
-class TrajectoryInterpolator:
-    """
-    Helper class for interpolating trajectories
-    Expects either a 7-element trajectory as: [T x [x, y, z, qx, qy, qz, qw]]
-    or a 13-element trajectory as: [T x [x, y, z, qx, qy, qz, qw, vx, vy, vz, wx, wy, wz]]
 
-    funtionally, works identically to the scipy interpolation object
+class MultiDimensionalInterpolator:
     """
-    def __init__(self, times, traj, tol=1e-1, interp_kwargs={}):
+    Helper class for interpolating generic timeseries
+    Expects either a N-element trajectory as: [T x N], where N is an arbitrary
+    dimension timeseries. This could be an odometry trajectory, command list, etc.
+
+    Funtionally, this works identically to the scipy interpolation object.
+    This interpolator can handle torch or numpy inputs and returns the same
+    type as the input.
+    """
+    def __init__(self,
+                 times: np.ndarray | torch.Tensor,
+                 traj: np.ndarray | torch.Tensor,
+                 rot_mask: np.ndarray | torch.Tensor=None,
+                 tol: float=1e-1,
+                 interp_kwargs={}):
         """
         Args:
-            traj: the traj to interpolate (of shape [T x {7,13}])
+            traj: the traj to interpolate (of shape [T x N])
             times: the times corresponding to the traj
+            rot_mask: Mask for rotation interpolation instead of generic 1D
+                      interpolations. 1 indicates rotation index. For now, we
+                      assume all rot elements are next to each other and of
+                      order: qx, qy, qz, qw
             tol: the amount of allowable extrapolation
         """
-        assert len(traj.shape) == 2, 'Expected traj of shape [T x 7/13], got {}'.format(traj.shape)
-        assert traj.shape[-1] in [7, 13], 'Expected traj of shape [T x 7/13], got {}'.format(traj.shape)
+        # Format into np. Assuming if traj is torch, then output should be torch.
+        if isinstance(times, torch.Tensor):
+            times = times.cpu().numpy()
+        if isinstance(rot_mask, torch.Tensor):
+            rot_mask = rot_mask.cpu().numpy()
+        if isinstance(traj, torch.Tensor):
+            self._torch_types = True
+            self._device = traj.device
+            traj = traj.cpu().numpy()
+        else:
+            self._torch_types = False
+
+        # Set defauls and reshape traj if only 1D
+        if len(traj.shape) == 1:
+            traj = traj.reshape(traj.shape[0], 1)
+        if rot_mask is None:
+            rot_mask = np.zeros(traj.shape[-1], dtype=bool)
+
+        assert len(traj.shape) == 2, 'Expected traj of shape [T x N], got {}'.format(traj.shape)
+        assert traj.shape[-1] == rot_mask.shape[0], 'Rotation mask dimension must match traj N={}'.format(traj.shape[-1])
         assert times.shape[0] == traj.shape[0], 'Got {} times, but {} steps in traj'.format(times.shape[0], traj.shape[0])
+        assert (~rot_mask).all() or rot_mask.sum() == 4, 'Requires either no rotation or mask with 4 elements for a quaternion, not {}'.format(rot_mask.sum())
 
-        self.is_velocity = (traj.shape[-1] == 13)
-        self.tol = tol
-
+        self._tol = tol
+        self._N = traj.shape[-1]
+        self._traj_interp = np.zeros(self._N, dtype=traj.dtype)
+        self._rot_mask = rot_mask
+        self._has_rot = np.any(self._rot_mask)
 
         #add tol
-        times = np.concatenate([np.array([times[0]-self.tol]), times, np.array([times[-1] + self.tol])])
+        times = np.concatenate([np.array([times[0]-self._tol]), times, np.array([times[-1] + self._tol])])
         traj = np.concatenate([traj[[0]], traj, traj[[-1]]], axis=0)
 
         #edge case check
         idxs = np.argsort(times)
 
-        #interpolate traj to get accurate times
-        self.interp_x = scipy.interpolate.interp1d(times[idxs], traj[idxs, 0], **interp_kwargs)
-        self.interp_y = scipy.interpolate.interp1d(times[idxs], traj[idxs, 1], **interp_kwargs)
-        self.interp_z = scipy.interpolate.interp1d(times[idxs], traj[idxs, 2], **interp_kwargs)
-        
-        rots = scipy.spatial.transform.Rotation.from_quat(traj[:, 3:7])
-        self.interp_q = scipy.spatial.transform.Slerp(times[idxs], rots[idxs], **interp_kwargs)
+        # Create interpolators only for non-rotation dimensions
+        self._interps = [
+            scipy.interpolate.interp1d(times[idxs], traj[idxs, i], **interp_kwargs) 
+            for i in np.where(~self._rot_mask)[0]
+        ]
 
-        if self.is_velocity:
-            self.interp_vx = scipy.interpolate.interp1d(times[idxs], traj[idxs, 7], **interp_kwargs)
-            self.interp_vy = scipy.interpolate.interp1d(times[idxs], traj[idxs, 8], **interp_kwargs)
-            self.interp_vz = scipy.interpolate.interp1d(times[idxs], traj[idxs, 9], **interp_kwargs)
-
-            self.interp_wx = scipy.interpolate.interp1d(times[idxs], traj[idxs, 10], **interp_kwargs)
-            self.interp_wy = scipy.interpolate.interp1d(times[idxs], traj[idxs, 11], **interp_kwargs)
-            self.interp_wz = scipy.interpolate.interp1d(times[idxs], traj[idxs, 12], **interp_kwargs)
+        # Create interpolators for rotation dimensions
+        if self._has_rot:
+            rots = scipy.spatial.transform.Rotation.from_quat(traj[:, self._rot_mask])
+            self._rot_interp = scipy.spatial.transform.Slerp(times[idxs], rots[idxs], **interp_kwargs)
 
     def __call__(self, qtimes):
         """
@@ -101,36 +131,67 @@ class TrajectoryInterpolator:
         Args:
             qtimes: the set of times to query
         """
-        if self.is_velocity:
-            xs = self.interp_x(qtimes)
-            ys = self.interp_y(qtimes)
-            zs = self.interp_z(qtimes)
-            qs = self.interp_q(qtimes).as_quat()
+        return self[qtimes]
 
-            vxs = self.interp_vx(qtimes)
-            vys = self.interp_vy(qtimes)
-            vzs = self.interp_vz(qtimes)
-            wxs = self.interp_wx(qtimes)
-            wys = self.interp_wy(qtimes)
-            wzs = self.interp_wz(qtimes)
+    def __getitem__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        if isinstance(qtimes, torch.Tensor):
+            qtimes = qtimes.cpu().numpy()
+        interp = np.stack([itrp(qtimes) for itrp in self._interps])
+        self._traj_interp[~self._rot_mask] = interp
 
-            traj = np.concatenate([
-                np.stack([xs, ys, zs], axis=-1),
-                qs,
-                np.stack([vxs, vys, vzs, wxs, wys, wzs], axis=-1)
-            ], axis=-1)
+        if self._has_rot:
+            rot_interp = self._rot_interp(qtimes).as_quat()
+            self._traj_interp[self._rot_mask] = rot_interp
+
+        if self._torch_types:
+            return torch.from_numpy(self._traj_interp)
         else:
-            xs = self.interp_x(qtimes)
-            ys = self.interp_y(qtimes)
-            zs = self.interp_z(qtimes)
-            qs = self.interp_q(qtimes).as_quat()
+            return self._traj_interp
 
-            traj = np.concatenate([
-                np.stack([xs, ys, zs], axis=-1),
-                qs
-            ], axis=-1)
 
-        return traj
+class TrajectoryInterpolator(MultiDimensionalInterpolator):
+    """
+    Helper class for interpolating generic timeseries
+    Expects either a 7 or 13-element trajectory as: [T x {7,13}], for
+    interpolating odometry trajectories of [x y z qx qy qz qw vx vy vz wx wy wz]
+    or pose trajectores of [x y z qx qy qz qw]
+
+    funtionally, works identically to the scipy interpolation object
+    """
+    def __init__(self,
+                 times: np.ndarray | torch.Tensor,
+                 traj: np.ndarray | torch.Tensor,
+                 tol: float=1e-1,
+                 interp_kwargs={}):
+        
+        assert len(traj.shape) == 2, 'Expected traj of shape [T x {7,13}], got {}'.format(traj.shape)
+        if traj.shape[-1] == 7:
+            mask = POSE_MASK
+        elif traj.shape[-1] == 13:
+            mask = ODOM_MASK
+        super().__init__(times, traj, mask, tol, interp_kwargs)
+    
+    def __call__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        return super().__call__(qtimes)
+
+    def __getitem__(self, qtimes):
+        """
+        Interpolate the traj according to qtimes.
+        Args:
+            qtimes: the set of times to query
+        """
+        return super().__getitem__(qtimes)
+
 
 def make_footprint(length, width, nl, nw, length_offset, width_offset, device='cpu'):
     xs = torch.linspace(-length/2., length/2., nl, device=device) + length_offset
