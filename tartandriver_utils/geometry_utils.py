@@ -16,14 +16,24 @@ def quat_to_yaw(quat):
 def pose_to_htm(pose):
     """convert a pose (position + quaternion) to a homogeneous transform matrix
     """
-    p = pose[:3]
-    q = pose[3:7]
+    if isinstance(pose, torch.Tensor):
+        device = pose.device
+        res = pose_to_htm(pose.cpu().numpy())
+        return torch.tensor(res, device=device)
+
+    if len(pose.shape) == 1:
+        return pose_to_htm(np.expand_dims(pose, 0))[0]
+
+    n = pose.shape[0]
+
+    p = pose[:, :3]
+    q = pose[:, 3:7]
 
     R = scipy.spatial.transform.Rotation.from_quat(q).as_matrix()
 
-    htm = np.eye(4)
-    htm[:3, :3] = R
-    htm[:3, -1] = p
+    htm = np.tile(np.eye(4), [n,1,1])
+    htm[:, :3, :3] = R
+    htm[:, :3, -1] = p
 
     return htm
 
@@ -31,10 +41,21 @@ def htm_to_pose(htm):
     """convert a htm (4x4) matrix to a pose (position + quaternion)
     (quaternion will be [qx, qy, qz, qw])
     """
-    R = htm[:3, :3]
-    p = htm[:3, -1]
+    if isinstance(htm, torch.Tensor):
+        device = htm.device
+        res = htm_to_pose(htm.cpu().numpy())
+        return torch.tensor(res, device=device)
+
+    if len(htm.shape) == 2:
+        return htm_to_pose(np.expand_dims(htm, 0))[0]
+
+    n = htm.shape[0]
+
+    R = htm[:, :3, :3]
+    p = htm[:, :3, -1]
     q = scipy.spatial.transform.Rotation.from_matrix(R).as_quat()
-    pose = np.concatenate([p, q])
+    pose = np.concatenate([p, q], axis=-1)
+
     return pose
 
 def transform_points(points, htm):
