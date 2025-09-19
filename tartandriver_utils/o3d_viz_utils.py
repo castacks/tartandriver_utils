@@ -2,6 +2,20 @@ import torch
 import numpy as np
 import open3d as o3d
 
+def normalize_dino(img, return_min_max=False):
+    if img.numel() == 0:
+        return img[..., :3]
+
+    _img = img[..., :3]
+    _ndims = len(img.shape) - 1
+    _dims = [1] * _ndims + [3]
+    vmin = _img.reshape(-1, 3).min(dim=0)[0].view(*_dims)
+    vmax = _img.reshape(-1, 3).max(dim=0)[0].view(*_dims)
+    if return_min_max:
+        return (_img - vmin) / (vmax - vmin), (vmin, vmax)
+    else:
+        return (_img - vmin) / (vmax - vmin)
+
 def traj_to_o3d(traj, color=[0., 0., 0.]):
     if isinstance(traj, torch.Tensor):
         return traj_to_o3d(traj.detach().cpu().numpy())

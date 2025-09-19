@@ -19,7 +19,7 @@ def pose_to_htm(pose):
     if isinstance(pose, torch.Tensor):
         device = pose.device
         res = pose_to_htm(pose.cpu().numpy())
-        return torch.tensor(res, device=device)
+        return torch.tensor(res, dtype=pose.dtype, device=device)
 
     if len(pose.shape) == 1:
         return pose_to_htm(np.expand_dims(pose, 0))[0]
