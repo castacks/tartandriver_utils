@@ -1,5 +1,58 @@
 import os
 import numpy as np
+import yaml
+class YamlLoader(yaml.SafeLoader):
+    """
+    YAML Loader to loading YAMLs with nested YAMLs
+
+    Example usage:
+    Consider two separate yamls:
+
+    `foo.yaml`:
+    ```
+    a: 1
+    b: ['hello', 'there']
+    c: !include bar.yaml
+    ```
+    
+    `bar.yaml`:
+    ```
+    x: 42
+    y:
+    - 'General'
+    - 'Kenobi'
+    ```
+    
+    We automatically loaded nested YAMLs like so:
+    ```
+    from tartandriver_utils.os_utils import YamlLoader
+    with open('conf1.yaml', 'r') as f:
+        config = yaml.load(f, YamlLoader)
+    ```
+    Resulting config
+    ```
+    print(config)
+    { 'a': 1,
+      'b': ['hello', 'there'],
+      'c': {'x': 42, 'y': ['General', 'Kenobi']}
+    }
+    ```
+    """
+
+    def __init__(self, stream):
+
+        self._root = os.path.split(stream.name)[0]
+
+        super(YamlLoader, self).__init__(stream)
+        super(YamlLoader, self).add_constructor('!include', YamlLoader.include)
+
+    def include(self, node):
+
+        filename = os.path.join(self._root, self.construct_scalar(node))
+
+        with open(filename, 'r') as f:
+            return yaml.load(f, YamlLoader)
+
 
 def is_rosbag_dir(fp):
     """
