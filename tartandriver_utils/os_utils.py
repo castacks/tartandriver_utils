@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import yaml
+
 class YamlLoader(yaml.SafeLoader):
     """
     YAML Loader to loading YAMLs with nested YAMLs
@@ -52,7 +53,9 @@ class YamlLoader(yaml.SafeLoader):
 
         with open(filename, 'r') as f:
             return yaml.load(f, YamlLoader)
-
+        
+def load_yaml(fp):
+    return yaml.load(open(fp, 'r'), YamlLoader)
 
 def is_rosbag_dir(fp):
     """
