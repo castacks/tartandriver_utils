@@ -57,6 +57,9 @@ class YamlLoader(yaml.SafeLoader):
 def load_yaml(fp):
     return yaml.load(open(fp, 'r'), YamlLoader)
 
+def save_yaml(config, fp):
+    yaml.dump(config, open(fp, 'w'), default_flow_style=False)
+
 def is_rosbag_dir(fp):
     """
     Determine if a dir is a valid rosbag (check for mcaps and metadata.yaml)
