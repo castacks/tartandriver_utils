@@ -64,6 +64,9 @@ def is_rosbag_dir(fp):
     """
     Determine if a dir is a valid rosbag (check for mcaps and metadata.yaml)
     """
+    if not os.path.isdir(fp):
+        return False
+    
     dir_files = os.listdir(fp)
 
     has_metadata = "metadata.yaml" in dir_files
@@ -75,6 +78,9 @@ def is_kitti_dir(fp):
     """
     Determine if a dir is a valid rosbag (check for target_timestamps.txt)
     """
+    if not os.path.isdir(fp):
+        return False
+
     dir_files = os.listdir(fp)
 
     has_timestamps = "target_timestamps.txt" in dir_files
