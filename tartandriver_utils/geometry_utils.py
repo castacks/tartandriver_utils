@@ -132,19 +132,29 @@ class MultiDimensionalInterpolator:
         times = np.concatenate([np.array([times[0]-self._tol]), times, np.array([times[-1] + self._tol])])
         traj = np.concatenate([traj[[0]], traj, traj[[-1]]], axis=0)
 
-        #edge case check
+        #ensure that times are in strictly increasing order
         idxs = np.argsort(times)
+
+        times_sorted  = times[idxs]
+        traj_sorted = traj[idxs]
+
+        tdiffs = times_sorted[1:] - times_sorted[:-1]
+        valid_mask = np.ones(times_sorted.shape[0], dtype=bool)
+        valid_mask[1:] = (tdiffs > 1e-16)
+
+        times_to_interp = times_sorted[valid_mask]
+        traj_to_interp = traj_sorted[valid_mask]
 
         # Create interpolators only for non-rotation dimensions
         self._interps = [
-            scipy.interpolate.interp1d(times[idxs], traj[idxs, i], **interp_kwargs) 
+            scipy.interpolate.interp1d(times_to_interp, traj_to_interp[:, i], **interp_kwargs) 
             for i in np.where(~self._rot_mask)[0]
         ]
 
         # Create interpolators for rotation dimensions
         if self._has_rot:
-            rots = scipy.spatial.transform.Rotation.from_quat(traj[:, self._rot_mask])
-            self._rot_interp = scipy.spatial.transform.Slerp(times[idxs], rots[idxs], **interp_kwargs)
+            rots = scipy.spatial.transform.Rotation.from_quat(traj_to_interp[:, self._rot_mask])
+            self._rot_interp = scipy.spatial.transform.Slerp(times_to_interp, rots, **interp_kwargs)
 
     def __call__(self, qtimes):
         """
@@ -160,19 +170,21 @@ class MultiDimensionalInterpolator:
         Args:
             qtimes: the set of times to query
         """
+        res = np.copy(self._traj_interp)
         if isinstance(qtimes, torch.Tensor):
             qtimes = qtimes.cpu().numpy()
+
         interp = np.stack([itrp(qtimes) for itrp in self._interps])
-        self._traj_interp[~self._rot_mask] = interp
+        res[~self._rot_mask] = interp
 
         if self._has_rot:
             rot_interp = self._rot_interp(qtimes).as_quat()
-            self._traj_interp[self._rot_mask] = rot_interp
+            res[self._rot_mask] = rot_interp
 
         if self._torch_types:
-            return torch.from_numpy(self._traj_interp)
+            return torch.from_numpy(res)
         else:
-            return self._traj_interp
+            return res
 
 
 class TrajectoryInterpolator(MultiDimensionalInterpolator):
