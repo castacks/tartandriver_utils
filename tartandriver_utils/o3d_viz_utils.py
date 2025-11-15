@@ -33,6 +33,21 @@ def traj_to_o3d(traj, color=[0., 0., 0.]):
 
     return out
 
+def get_atv_mesh(fp='/home/tartandriver/tartandriver_ws/src/core/tartandriver_utils/atv_mesh/textured.obj'):
+    """
+    Load the ATV mesh into open3d for viz. Note that the ATV will be transformed such that
+        (0,0,0) lines up (roughly) with the center of the rear axle (and in FLU)
+    TODO figure out better pathing
+    """
+    mesh = o3d.io.read_triangle_mesh(fp, enable_post_processing=True)
+    H = np.array([
+        [0., 0., 1., 1.37],
+        [1., 0., 0., 0.1],
+        [0., 1., 0., 0.75],
+        [0., 0., 0., 1.]
+    ])
+    return mesh.transform(H)
+
 def make_bev_mesh(metadata, height, mask, colors):
     xy_coords = metadata.get_coords()
     coords = torch.cat([xy_coords, height.unsqueeze(-1)], dim=-1)

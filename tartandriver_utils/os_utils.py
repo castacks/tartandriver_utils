@@ -91,4 +91,8 @@ def kitti_n_frames(dir):
     """
     Get the number of frames in a KITTI dataset
     """
-    return np.loadtxt(os.path.join(dir, 'target_timestamps.txt')).shape[0]
+    if os.path.exists(os.path.join(dir, 'target_timestamps.txt')):
+        return np.loadtxt(os.path.join(dir, 'target_timestamps.txt')).shape[0]
+    
+    elif os.path.exists(os.path.join(dir, 'timestamps.txt')):
+        return np.loadtxt(os.path.join(dir, 'timestamps.txt')).shape[0]
