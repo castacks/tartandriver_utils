@@ -1,3 +1,4 @@
+import io
 import os
 import numpy as np
 import yaml
@@ -51,11 +52,20 @@ class YamlLoader(yaml.SafeLoader):
 
         filename = os.path.join(self._root, self.construct_scalar(node))
 
-        with open(filename, 'r') as f:
-            return yaml.load(f, YamlLoader)
+        with open(filename, "r") as f:
+            content = os.path.expandvars(f.read())
+        stream = io.StringIO(content)
+        stream.name = filename
+        return yaml.load(stream, YamlLoader)
         
 def load_yaml(fp):
-    return yaml.load(open(fp, 'r'), YamlLoader)
+    # identify and expand any env vars
+    with open(fp,"r") as f:
+       content = os.path.expandvars(f.read())
+    # turn string content into stream for loader
+    stream = io.StringIO(content)
+    stream.name = fp
+    return yaml.load(stream, YamlLoader)
 
 def save_yaml(config, fp):
     yaml.dump(config, open(fp, 'w'), default_flow_style=False)
