@@ -1,0 +1,12 @@
+## YAML nesting
+
+subyaml: !include leaf.yaml
+
+## env substitutions
+
+var_with_dollar: $hello
+tartandriver_home: $TARTANDRIVER_HOME
+not_env_var: $NOT_ENV_VAR
+regular_dollar: a dollar sign -> $
+
+subyaml_with_env_var: !include $TARTANDRIVER_HOME/src/core/tartandriver_utils/config/leaf.yaml
