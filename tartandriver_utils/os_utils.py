@@ -61,7 +61,8 @@ class YamlLoader(yaml.SafeLoader):
     
     def listcat(self, node):
         out = []
-        value = self.construct_sequence(node)
+        #need this to work with w/ include and explicit
+        value = self.construct_sequence(node, deep=True)
         for x in value:
             out.extend(x)
         return out
