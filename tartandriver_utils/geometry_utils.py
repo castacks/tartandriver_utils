@@ -5,6 +5,7 @@ import numpy as np
 import scipy.interpolate, scipy.spatial
 
 ODOM_MASK = np.asarray([0,0,0,1,1,1,1,0,0,0,0,0,0], dtype=bool)
+IMU_MASK = np.asarray([1,1,1,1,0,0,0,0,0,0], dtype=bool)
 POSE_MASK = np.asarray([0,0,0,1,1,1,1], dtype=bool)
 
 def quat_to_yaw(quat):
