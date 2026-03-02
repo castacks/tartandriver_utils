@@ -47,6 +47,7 @@ class YamlLoader(yaml.SafeLoader):
 
         super(YamlLoader, self).__init__(stream)
         super(YamlLoader, self).add_constructor('!include', YamlLoader.include)
+        super(YamlLoader, self).add_constructor('!listcat', YamlLoader.listcat)
 
     def include(self, node):
 
@@ -57,6 +58,14 @@ class YamlLoader(yaml.SafeLoader):
         stream = io.StringIO(content)
         stream.name = filename
         return yaml.load(stream, YamlLoader)
+    
+    def listcat(self, node):
+        out = []
+        #need this to work with w/ include and explicit
+        value = self.construct_sequence(node, deep=True)
+        for x in value:
+            out.extend(x)
+        return out
         
 def load_yaml(fp):
     # identify and expand any env vars
@@ -68,7 +77,8 @@ def load_yaml(fp):
     return yaml.load(stream, YamlLoader)
 
 def save_yaml(config, fp):
-    yaml.dump(config, open(fp, 'w'), default_flow_style=False)
+    with open(fp, 'w') as fh:
+        yaml.dump(config, fh, default_flow_style=False)
 
 def is_rosbag_dir(fp):
     """
