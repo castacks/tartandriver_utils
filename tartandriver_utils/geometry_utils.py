@@ -14,6 +14,14 @@ def quat_to_yaw(quat):
     """
     return np.arctan2(2 * (quat[3]*quat[2] + quat[0]*quat[1]), 1 - 2 * (quat[1]**2 + quat[2]**2))
 
+def yaw_to_quat(yaw):
+    return np.array([
+        np.cos(yaw/2.),
+        0.,
+        0.,
+        np.sin(yaw/2.)
+    ])
+
 def pose_to_htm(pose):
     """convert a pose (position + quaternion) to a homogeneous transform matrix
     """
