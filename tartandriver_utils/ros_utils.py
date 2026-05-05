@@ -1,6 +1,8 @@
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from builtin_interfaces.msg import Time
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion, Pose
 
 from core_interfaces.msg import Mission, Waypoint
@@ -52,3 +54,11 @@ def waypoint_pose_to_msg(wpt: Pose, frame, radius):
     waypoint.position.y = wpt.position.y
     waypoint.position.z = wpt.position.z
     return waypoint
+
+def odom_to_pose(msg: Odometry):
+    """Return (translation np.ndarray(3,), rotation-matrix np.ndarray(3,3))."""
+    p = msg.pose.pose.position
+    q = msg.pose.pose.orientation
+    t = np.array([p.x, p.y, p.z])
+    R = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+    return t, R

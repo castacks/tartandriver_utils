@@ -14,6 +14,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         (os.path.join('share', package_name), glob('launch/*.py')),
+        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
         (os.path.join('share', package_name), glob("atv_mesh/*", recursive=True))
     ],
     install_requires=["setuptools"],
@@ -23,5 +24,9 @@ setup(
     description="Package for converting from ROS to torch",
     license="BSD-3-Clause",
     tests_require=["pytest"],
-    entry_points={},
+    entry_points= {
+        'console_scripts': [
+            f'rtk_spoofer_node = {package_name}.ros.rtk_spoofer_node:main',
+        ],
+    }
 )
