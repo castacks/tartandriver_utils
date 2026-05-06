@@ -49,7 +49,7 @@ def generate_launch_description():
             {"use_sim_time": LaunchConfiguration("use_sim_time"),}
         ]
     )
-    # can't get feature extraction for dewarping/undistortion to yield good result
+    # uncomment feature_extraction if want to register dewarped cloud
     # feature_extraction_node = Node(
     #     package="super_odometry",
     #     executable="feature_extraction_node",
@@ -62,6 +62,7 @@ def generate_launch_description():
     #           "use_sim_time": LaunchConfiguration("use_sim_time"),
     #     }],
     # )
+
     # laser_mapping_node = Node(
     #     package="super_odometry",
     #     executable="laser_mapping_node",

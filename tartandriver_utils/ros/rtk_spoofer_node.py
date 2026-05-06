@@ -1,15 +1,23 @@
 import rclpy
-from rclpy.node import Node
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import PointCloud2
 import numpy as np
-# import ros2_numpy
-from ros_torch_converter.datatypes.pointcloud import PointCloudTorch
 import torch
-from collections import deque
 from scipy.spatial.transform import Rotation
 
+import tf2_ros
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from geometry_msgs.msg import TransformStamped
+from super_odometry_msgs.msg import LaserFeature
+
 from tartandriver_utils.ros_utils import odom_to_pose
+from tartandriver_utils.geometry_utils import transform_points
+
+from ros_torch_converter.datatypes.pointcloud import PointCloudTorch
+from ros_torch_converter.datatypes.transform import TransformTorch
 
 
 class RTKSpooferNode(Node):
@@ -30,23 +38,24 @@ class RTKSpooferNode(Node):
         publish_rate = self.get_parameter('publish_rate').value
         self.frame_id  = self.get_parameter('frame_id').value
 
-        self.init_pose: Odometry = None   # first message received
-
         # SE3 origin stored as (translation, rotation-matrix)
         self.origin_t: np.ndarray = None
         self.origin_R: np.ndarray = None
 
-        # Rolling 2-second buffer of (stamp_sec, t, R) for closest-pose lookup
-        self.pose_buffer = deque()
-        self.buffer_seconds: float = 2.0
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        self.rtk_sub = self.create_subscription(Odometry, rtk_topic, self._rtk_callback, 10)
-        self.cloud_sub = self.create_subscription(PointCloud2, cloud_topic, self._cloud_callback, 10 )
+        # Put each callback in its own group since MultiThreadedExecutor. Reentrant
+        # vs Mutually exclusive doesn't matter since just one callback per group
+        rtk_group = ReentrantCallbackGroup()
+        cloud_group = ReentrantCallbackGroup()
+        self.rtk_sub = self.create_subscription(Odometry, rtk_topic, self._rtk_callback, 10, callback_group=rtk_group)
+        # self.cloud_sub = self.create_subscription(LaserFeature, cloud_topic, self._cloud_callback, 10, callback_group=cloud_group)
+        self.cloud_sub = self.create_subscription(PointCloud2, cloud_topic, self._cloud_callback, 10, callback_group=cloud_group)
 
         self.odom_pub = self.create_publisher(Odometry, publish_topic_odom, 10)
         self.cloud_pub = self.create_publisher(PointCloud2, publish_topic_cloud, 10)
-
-        self.create_timer(1.0 / publish_rate, self._publish_callback)
 
         self.get_logger().info(
             f"RTKSpooferNode ready. Listening on '{rtk_topic}', "
@@ -54,71 +63,24 @@ class RTKSpooferNode(Node):
         )
 
     def _rtk_callback(self, msg: Odometry) -> None:
-        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         t, R = odom_to_pose(msg)
-
-        self.pose_buffer.append((stamp, t, R))
-        cutoff = stamp - self.buffer_seconds
-        while self.pose_buffer and self.pose_buffer[0][0] < cutoff:
-            self.pose_buffer.popleft()
-
-        if self.init_pose is None:
-            self.init_pose = msg
+        if self.origin_t is None:
             self.origin_t = t
             self.origin_R = R
             self.get_logger().info(
-                f"Origin initialised at  t={t.tolist()}  "
+                f"Origin initialized at  t={t.tolist()}  "
                 f"(yaw={np.degrees(Rotation.from_matrix(R).as_euler('xyz')[2]):.2f} deg)"
             )
 
-    def _closest_pose(self, query_sec: float):
-        """Return (t, R) from the buffer entry closest to query_sec."""
-        if not self.pose_buffer:
-            return None, None
-        _, t, R = min(self.pose_buffer, key=lambda e: abs(e[0] - query_sec))
-        return t, R
+        rel_R = self.origin_R.T @ R
+        rel_t = self.origin_R.T @ (t - self.origin_t)
+        rel_q = Rotation.from_matrix(rel_R).as_quat()
 
-    def _cloud_callback(self, msg: PointCloud2) -> None:
-        """Transform the undistorted cloud into the origin frame and republish."""
-        if self.origin_t is None:
-            return
-
-        cloud_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        cur_t, cur_R = self._closest_pose(cloud_stamp)
-        if cur_t is None:
-            return
-
-        pc = PointCloudTorch.from_rosmsg(msg)
-        xyz = pc.pts.numpy()  # shape (N, 3)
-        if xyz.shape[0] == 0:
-            return
-
-        xyz_world = (cur_R @ xyz.T).T + cur_t
-        xyz_rel = (self.origin_R.T @ (xyz_world - self.origin_t).T).T
-
-        pc.pts = torch.tensor(xyz_rel, dtype=torch.float32)
-        pc.frame_id = self.frame_id
-        self.cloud_pub.publish(pc.to_rosmsg())
-
-    def _publish_callback(self) -> None:
-        """Publish the relative odometry at the configured rate."""
-        if self.origin_t is None:
-            return
-
-        now = self.get_clock().now().nanoseconds * 1e-9
-        cur_t, cur_R = self._closest_pose(now)
-        if cur_t is None:
-            return
-
-        rel_R = self.origin_R.T @ cur_R
-        rel_t = self.origin_R.T @ (cur_t - self.origin_t)
-        rel_q = Rotation.from_matrix(rel_R).as_quat()  # [x, y, z, w]
-
+        # publish odom
         odom = Odometry()
-        sec = int(now)
-        odom.header.stamp.sec = sec
-        odom.header.stamp.nanosec = int((now - sec) * 1e9)
+        odom.header.stamp = msg.header.stamp
         odom.header.frame_id = self.frame_id
+        odom.child_frame_id = 'vehicle'
         odom.pose.pose.position.x = float(rel_t[0])
         odom.pose.pose.position.y = float(rel_t[1])
         odom.pose.pose.position.z = float(rel_t[2])
@@ -126,12 +88,70 @@ class RTKSpooferNode(Node):
         odom.pose.pose.orientation.y = float(rel_q[1])
         odom.pose.pose.orientation.z = float(rel_q[2])
         odom.pose.pose.orientation.w = float(rel_q[3])
+        J = np.block([[self.origin_R.T, np.zeros((3, 3))],
+                      [np.zeros((3, 3)), self.origin_R.T]])
+        cov = np.array(msg.pose.covariance).reshape(6, 6)
+        odom.pose.covariance = (J @ cov @ J.T).flatten().tolist()
+        odom.twist = msg.twist  # twist twist and covariance is in body frame, no rotation needed
         self.odom_pub.publish(odom)
+        
+        # publish TF
+        t = TransformStamped()
+        t.header.stamp = msg.header.stamp
+        t.header.frame_id = self.frame_id
+        t.child_frame_id = 'vehicle'
+
+        t.transform.translation.x = float(rel_t[0])
+        t.transform.translation.y = float(rel_t[1])
+        t.transform.translation.z = float(rel_t[2])
+        t.transform.rotation.x = float(rel_q[0])
+        t.transform.rotation.y = float(rel_q[1])
+        t.transform.rotation.z = float(rel_q[2])
+        t.transform.rotation.w = float(rel_q[3])
+
+        self.tf_broadcaster.sendTransform(t)
+
+    def _cloud_callback(self, msg: PointCloud2) -> None:
+        """Transform the undistorted cloud into the origin frame and republish."""
+        stamp = msg.header.stamp
+        src_frame = msg.header.frame_id
+        dst_frame = self.frame_id
+
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(dst_frame, src_frame, stamp, Duration(seconds=0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(f"cant tf from {dst_frame} to {src_frame}: {e}")
+            return
+        htm = TransformTorch.from_rosmsg(tf_msg, device='cpu').transform
+
+        pc = PointCloudTorch.from_rosmsg(msg)
+        xyz_src = pc.pts
+        if xyz_src.shape[0] == 0:
+            return
+
+        xyz_dst = transform_points(xyz_src, htm)
+
+        pc.pts = torch.tensor(xyz_dst, dtype=torch.float32)
+        pc.frame_id = self.frame_id
+        self.cloud_pub.publish(pc.to_rosmsg())
+
+    # use undistorted cloud from super odometry
+    # def _cloud_callback(self, msg: LaserFeature) -> None:
+    #     """Transform the undistorted cloud into the origin frame and republish."""
+    #     pc = PointCloudTorch.from_rosmsg(msg.cloud_nodistortion)
+    #     xyz_src = pc.pts
+    #     if xyz_src.shape[0] == 0:
+    #         return
+    #     pc.frame_id = 'vehicle'
+    #     self.cloud_pub.publish(pc.to_rosmsg())
+
 
 def main():
     rclpy.init()
     rtk_spoofer_node = RTKSpooferNode()
-    rclpy.spin(rtk_spoofer_node)
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(rtk_spoofer_node)
+    executor.spin()
     rtk_spoofer_node.destroy_node()
     rclpy.shutdown()
 
