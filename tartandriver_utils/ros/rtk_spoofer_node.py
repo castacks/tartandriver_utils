@@ -80,7 +80,7 @@ class RTKSpooferNode(Node):
         odom = Odometry()
         odom.header.stamp = msg.header.stamp
         odom.header.frame_id = self.frame_id
-        odom.child_frame_id = 'vehicle'
+        odom.child_frame_id = 'vehicle_rtk'
         odom.pose.pose.position.x = float(rel_t[0])
         odom.pose.pose.position.y = float(rel_t[1])
         odom.pose.pose.position.z = float(rel_t[2])
@@ -99,7 +99,7 @@ class RTKSpooferNode(Node):
         t = TransformStamped()
         t.header.stamp = msg.header.stamp
         t.header.frame_id = self.frame_id
-        t.child_frame_id = 'vehicle'
+        t.child_frame_id = 'vehicle_rtk'
 
         t.transform.translation.x = float(rel_t[0])
         t.transform.translation.y = float(rel_t[1])

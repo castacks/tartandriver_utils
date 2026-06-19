@@ -3,7 +3,7 @@ rtk_spoofer_node:
     rtk_topic: '/rtk_gps/ekf/odometry_earth'
     # undistorted_cloud_topic: '/superodometry/feature_info'
     undistorted_cloud_topic: '/velodyne_1/velodyne_points'
-    publish_topic_odom: '/superodometry/integrated_to_init'
-    publish_topic_cloud: '/superodometry/velodyne_cloud_registered'
+    publish_topic_odom: '/rtk_gps/ekf/rel_odometry_earth'
+    publish_topic_cloud: '/superodometry/velodyne_cloud_registered_spoofer'
     publish_rate: 100.0
     frame_id: 'sensor_init'
