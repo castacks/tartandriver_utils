@@ -51,7 +51,9 @@ class YamlLoader(yaml.SafeLoader):
 
     def include(self, node):
 
-        filename = os.path.join(self._root, self.construct_scalar(node))
+        filename = os.path.expanduser(os.path.expandvars(self.construct_scalar(node)))
+        if not os.path.isabs(filename):
+            filename = os.path.join(self._root, filename)
 
         with open(filename, "r") as f:
             content = os.path.expandvars(f.read())
