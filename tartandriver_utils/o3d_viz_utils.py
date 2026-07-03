@@ -1,20 +1,51 @@
 import torch
 import numpy as np
 import open3d as o3d
+import matplotlib.pyplot as plt
 
-def normalize_dino(img, return_min_max=False):
+def normalize_dino(img, return_min_max=False, vlim=None):
     if img.numel() == 0:
         return img[..., :3]
 
     _img = img[..., :3]
     _ndims = len(img.shape) - 1
     _dims = [1] * _ndims + [3]
-    vmin = _img.reshape(-1, 3).min(dim=0)[0].view(*_dims)
-    vmax = _img.reshape(-1, 3).max(dim=0)[0].view(*_dims)
+
+    if vlim is None:
+        vmin = _img.reshape(-1, 3).min(dim=0)[0].view(*_dims)
+        vmax = _img.reshape(-1, 3).max(dim=0)[0].view(*_dims)
+    else:
+        vmin, vmax = vlim
+
     if return_min_max:
         return (_img - vmin) / (vmax - vmin), (vmin, vmax)
     else:
         return (_img - vmin) / (vmax - vmin)
+    
+def apply_cmap_to_torch_tensor(x, cmap, vlim):
+    if vlim is not None:
+        _x = x.clip(*vlim)
+    else:
+        _x = x
+
+    _x = (_x - _x.min()) / (_x.max() - _x.min())
+
+    if cmap == 'step':
+        _low_mask = _x < 0.1
+        _high_mask = _x > 0.9
+        _x = torch.stack([
+            torch.ones_like(_x),
+            1-_x,
+            torch.zeros_like(_x)
+        ], dim=-1)
+        _x[_high_mask] = 0.
+        _x[_low_mask] = 0.8
+    else:
+        _cmap = plt.colormaps[cmap]
+        #remove alpha
+        _x = torch.tensor(_cmap(_x.cpu().numpy()), device=_x.device)[..., :3]
+
+    return _x
 
 def traj_to_o3d(traj, color=[0., 0., 0.]):
     if isinstance(traj, torch.Tensor):
