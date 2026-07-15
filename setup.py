@@ -27,6 +27,7 @@ setup(
     entry_points= {
         'console_scripts': [
             f'rtk_spoofer_node = {package_name}.ros.rtk_spoofer_node:main',
+            f'angular_coverage_viz_node = {package_name}.ros.angular_coverage_viz:main',
         ],
     }
 )
