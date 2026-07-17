@@ -9,7 +9,31 @@ from pathlib import Path
 
 import numpy as np
 import tqdm
+import yaml
 from PIL import Image, ImageDraw, ImageFont
+
+
+def load_video_config(path):
+    """Load + normalize a video render config describing *what* to render.
+    """
+    cfg = {}
+    if path:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+    hud = None
+    hud_cfg = cfg.get("hud")
+    if hud_cfg and hud_cfg.get("enabled", True):
+        hud = {
+            "odom_topic": hud_cfg.get("odom_topic", "/odometry/filtered_odom"),
+            "pedal_topic": hud_cfg.get("pedal_topic", "/racepak/pedal_pos"),
+            "map_tif": hud_cfg.get("map_tif"),
+            "map_source": hud_cfg.get("map_source", "auto"),
+            "allow_network_tiles": hud_cfg.get("allow_network_tiles", False),
+            "workers": hud_cfg.get("workers"),
+        }
+
+    return {"hud": hud, "pip": cfg.get("pip", []) or []}
 
 
 def _as_map_size(map_size):
@@ -489,13 +513,15 @@ def render_kitti_video_with_hud(
     throttle_times=None,
     brake_vals=None,
     brake_times=None,
+    pip=None,
 ):
     """
-    Render an existing KITTI image directory with timestamp/speed/minimap HUD.
+    Render an existing KITTI image directory with timestamp/speed/minimap HUD
+    and optional picture-in-picture insets (see `render_kitti_video`).
     """
     pngs = sorted(glob.glob(os.path.join(frames_dir, "????????.png")))
     if not pngs:
-        return render_kitti_video(frames_dir, output_path=output_path, fps=fps)
+        return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
 
     timestamps_fp = os.path.join(frames_dir, "timestamps.txt")
     if os.path.exists(timestamps_fp):
@@ -511,7 +537,7 @@ def render_kitti_video_with_hud(
             f"  [overlay] timestamp count mismatch for {frames_dir} "
             f"({len(frame_ts)} timestamps for {len(pngs)} frames); rendering without HUD."
         )
-        return render_kitti_video(frames_dir, output_path=output_path, fps=fps)
+        return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
 
     with Image.open(pngs[0]) as img:
         canvas_size = img.size
@@ -547,7 +573,7 @@ def render_kitti_video_with_hud(
         brake_vals=brake_vals,
         brake_times=brake_times,
     )
-    rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir)
+    rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir, pip=pip)
     if rendered and cleanup_overlay_dir and os.path.isdir(overlay_dir):
         shutil.rmtree(overlay_dir)
         try:
@@ -558,9 +584,92 @@ def render_kitti_video_with_hud(
     return rendered
 
 
-def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None):
+def _pip_overlay_xy(pos, margin, cum):
+    """ffmpeg overlay x:y expressions for a PiP inset at the given corner.
+
+    `cum` is the horizontal pixel offset already consumed by previously placed
+    insets sharing this corner, so multiple insets stack along the edge."""
+    m = margin
+    if pos == "bottom-left":
+        return f"{m + cum}", f"main_h-overlay_h-{m}"
+    if pos == "top-right":
+        return f"main_w-overlay_w-{m + cum}", f"{m}"
+    if pos == "top-left":
+        return f"{m + cum}", f"{m}"
+    if pos == "bottom-center":
+        return f"(main_w-overlay_w)/2+{cum}", f"main_h-overlay_h-{m}"
+    # default: bottom-right
+    return f"main_w-overlay_w-{m + cum}", f"main_h-overlay_h-{m}"
+
+
+def _normalize_pip_specs(pip, n_frames, main_size):
+    """Validate + normalize PiP inset specs, dropping insets that don't exist in
+    the dataset or whose frame count doesn't match the main video.
     """
-    Render a directory of PNG frames into an MP4 with an optional RGBA HUD overlay.
+    if not pip:
+        return []
+    W, _H = main_size
+    valid = []
+    for spec in pip:
+        d = spec.get("dir")
+        if not d or not os.path.isdir(d):
+            print(f"  [pip] inset dir missing, skipping: {d}")
+            continue
+        insets = sorted(glob.glob(os.path.join(d, "????????.png")))
+        if not insets:
+            print(f"  [pip] no frames in inset dir, skipping: {d}")
+            continue
+        if len(insets) != n_frames:
+            print(
+                f"  [pip] inset frame count mismatch ({len(insets)} vs {n_frames}) "
+                f"for {d}; skipping inset."
+            )
+            continue
+        pw = max(2, int(round(W * float(spec.get("scale", 0.25)))))
+        if pw % 2:
+            pw += 1
+        valid.append({
+            "dir": d,
+            "pw": pw,
+            "pos": spec.get("pos", "bottom-right"),
+            "margin": int(spec.get("margin", 16)),
+            "border": int(spec.get("border", 3)),
+            "border_color": spec.get("border_color", "white"),
+        })
+    return valid
+
+
+def _build_pip_filter(specs, input_offset, base_label):
+    """Build the PiP portion of an ffmpeg -filter_complex graph.
+    """
+    segments = []
+    cur = base_label
+    cum = {}  # cumulative horizontal offset (px) per corner
+    for k, s in enumerate(specs):
+        idx = input_offset + k
+        b = s["border"]
+        if b > 0:
+            prep = (
+                f"[{idx}:v]scale={s['pw']}:-2,"
+                f"pad=iw+{2 * b}:ih+{2 * b}:{b}:{b}:color={s['border_color']}[pip{k}]"
+            )
+        else:
+            prep = f"[{idx}:v]scale={s['pw']}:-2[pip{k}]"
+        segments.append(prep)
+
+        c = cum.get(s["pos"], 0)
+        x, y = _pip_overlay_xy(s["pos"], s["margin"], c)
+        out = f"pipout{k}"
+        segments.append(f"{cur}[pip{k}]overlay={x}:{y}[{out}]")
+        cur = f"[{out}]"
+        cum[s["pos"]] = c + s["pw"] + 2 * b + s["margin"]
+    return ";".join(segments), cur
+
+
+def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None, pip=None):
+    """
+    Render a directory of PNG frames into an MP4 with an optional RGBA HUD
+    overlay and optional picture-in-picture insets.
     """
 
     pngs = sorted(glob.glob(os.path.join(frames_dir, "????????.png")))
@@ -605,13 +714,45 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None)
             )
             overlay_dir = None
 
-    if overlay_dir is not None:
-        cmd.extend([
-            "-framerate", str(fps),
-            "-start_number", "0",
-            "-i", os.path.join(overlay_dir, "%08d.png"),
-            "-filter_complex", f"[0:v][1:v]overlay=0:0[ov];[ov]{drawtext}",
-        ])
+    has_overlay = overlay_dir is not None
+
+    pip_specs = []
+    if pip:
+        with Image.open(pngs[0]) as _img:
+            main_size = _img.size
+        pip_specs = _normalize_pip_specs(pip, n_frames, main_size)
+
+    if has_overlay or pip_specs:
+        input_offset = 1
+        if has_overlay:
+            cmd.extend([
+                "-framerate", str(fps),
+                "-start_number", "0",
+                "-i", os.path.join(overlay_dir, "%08d.png"),
+            ])
+            input_offset = 2
+        for s in pip_specs:
+            cmd.extend([
+                "-framerate", str(fps),
+                "-start_number", "0",
+                "-i", os.path.join(s["dir"], "%08d.png"),
+            ])
+
+        segments = []
+        if has_overlay:
+            segments.append("[0:v][1:v]overlay=0:0[hud]")
+            base_label = "[hud]"
+        else:
+            base_label = "[0:v]"
+
+        if pip_specs:
+            pip_seg, final_label = _build_pip_filter(pip_specs, input_offset, base_label)
+            segments.append(pip_seg)
+        else:
+            final_label = base_label
+
+        segments.append(f"{final_label}{drawtext}")
+        cmd.extend(["-filter_complex", ";".join(segments)])
     else:
         cmd.extend(["-vf", drawtext])
 
