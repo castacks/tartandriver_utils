@@ -12,6 +12,7 @@ import tqdm
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 
+GRAVITY_MPS2 = 9.80665
 
 def load_video_config(path):
     """Load + normalize a video render config describing *what* to render.
@@ -26,7 +27,8 @@ def load_video_config(path):
     if hud_cfg and hud_cfg.get("enabled", True):
         hud = {
             "odom_topic": hud_cfg.get("odom_topic", "/odometry/filtered_odom"),
-            "pedal_topic": hud_cfg.get("pedal_topic", "/racepak/pedal_pos"),
+            "imu_topic": hud_cfg.get("imu_topic", "/novatel/imu/data"),
+            "gmeter_max_g": hud_cfg.get("gmeter_max_g", 1.0),
             "map_tif": hud_cfg.get("map_tif"),
             "map_source": hud_cfg.get("map_source", "auto"),
             "allow_network_tiles": hud_cfg.get("allow_network_tiles", False),
@@ -246,27 +248,48 @@ def _load_minimap_background(
     return bg, route_px, frame_px
 
 
-def _draw_pedal_bar(draw, x, y, w, h, value, color_empty, color_full):
-    """Horizontal gradient bar for throttle/brake, value in [0, 1]."""
-    value = float(np.clip(value, 0.0, 1.0))
-    draw.rectangle([x, y, x + w, y + h], fill=color_empty, outline=(80, 80, 80, 160), width=1)
-    if value < 0.01:
-        return
-    filled_w = max(1, int(w * value))
-    n_bands = min(filled_w, 40)
-    band_w = filled_w / n_bands
-    r0, g0, b0, a0 = color_empty
-    r1, g1, b1, a1 = color_full
-    for i in range(n_bands):
-        t = (i + 0.5) / n_bands
-        r = int(r0 + t * (r1 - r0))
-        g = int(g0 + t * (g1 - g0))
-        b = int(b0 + t * (b1 - b0))
-        a = int(a0 + t * (a1 - a0))
-        bx0 = x + 1 + int(i * band_w)
-        bx1 = x + 1 + min(int((i + 1) * band_w), filled_w - 1)
-        if bx1 > bx0:
-            draw.rectangle([bx0, y + 1, bx1, y + h - 1], fill=(r, g, b, a))
+def _draw_gmeter(draw, cx, cy, radius, ax_g, ay_g, max_g, font_label):
+    """Circular accelerometer g-meter, racing-dashboard style.
+
+    ax_g is longitudinal g (+forward/accel, -rearward/brake), ay_g is lateral g
+    (+left, -right, REP-103 body frame). The dot's position is the (ay, ax)
+    vector clipped to the dial; readouts at 12/3/6/9 o'clock show the current
+    accel/right/brake/left magnitude (each >= 0, 0 outside that phase).
+    """
+    ring_color = (255, 255, 255, 60)
+    axis_color = (255, 255, 255, 90)
+    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
+                 outline=ring_color, width=1)
+    draw.ellipse([cx - radius / 2, cy - radius / 2, cx + radius / 2, cy + radius / 2],
+                 outline=ring_color, width=1)
+    draw.line([cx - radius, cy, cx + radius, cy], fill=axis_color, width=1)
+    draw.line([cx, cy - radius, cx, cy + radius], fill=axis_color, width=1)
+
+    if np.isfinite(ax_g) and np.isfinite(ay_g):
+        mag = math.hypot(ax_g, ay_g)
+        scale = radius / max_g if mag <= max_g else radius / max(mag, 1e-6)
+        dot_x = cx - ay_g * scale
+        dot_y = cy - ax_g * scale
+        r = 5
+        draw.ellipse([dot_x - r, dot_y - r, dot_x + r, dot_y + r],
+                     fill=(255, 90, 90, 235), outline=(0, 0, 0, 180), width=1)
+    else:
+        ax_g = ay_g = 0.0
+
+    accel_g = max(ax_g, 0.0)
+    brake_g = max(-ax_g, 0.0)
+    right_g = max(-ay_g, 0.0)
+    left_g = max(ay_g, 0.0)
+
+    label_pad = 6
+    labels = [
+        (f"{accel_g:.2f}g", (cx, cy - radius - label_pad), "ms", (160, 255, 100, 230)),
+        (f"{brake_g:.2f}g", (cx, cy + radius + label_pad), "mt", (255, 110, 90, 230)),
+        (f"{right_g:.2f}g", (cx + radius + label_pad, cy), "lm", (120, 200, 255, 230)),
+        (f"{left_g:.2f}g", (cx - radius - label_pad, cy), "rm", (120, 200, 255, 230)),
+    ]
+    for text, pos, anchor, color in labels:
+        draw.text(pos, text, font=font_label, fill=color, anchor=anchor)
 
 
 def _draw_polyline(draw, points, fill, width=2):
@@ -284,8 +307,9 @@ def render_overlay_frame(args_tuple):
         frame_idx,
         speed_mps,
         wall_time_str,
-        frame_throttle,
-        frame_brake,
+        frame_ax_g,
+        frame_ay_g,
+        gmeter_max_g,
         map_background,
         route_px,
         frame_px,
@@ -342,18 +366,22 @@ def render_overlay_frame(args_tuple):
 
     img.alpha_composite(minimap, dest=(map_x, map_y))
 
-    # --- Bottom-right: Info panel (time + speed + throttle/brake) ---
-    bar_w = 160
-    bar_h = 14
-    label_w = 32
-    bar_row_h = bar_h + 8
+    # --- Bottom-right: Info panel (time + speed + g-meter) ---
+    gm_radius = 38
+    gm_diameter = 2 * gm_radius
+    gm_label_w_side = 36
+    gm_label_h_vert = 14
 
-    has_pedal = np.isfinite(frame_throttle) and np.isfinite(frame_brake)
+    gmeter_block_w = gm_diameter + 2 * gm_label_w_side
+    gmeter_block_h = gm_diameter + 2 * gm_label_h_vert
+
+    has_imu = np.isfinite(frame_ax_g) and np.isfinite(frame_ay_g)
+    text_block_w = 200
     inner_h = 20 + 4 + 32  # time + gap + speed
-    if has_pedal:
-        inner_h += 8 + bar_row_h + 4 + bar_row_h
+    if has_imu:
+        inner_h += 8 + gmeter_block_h
 
-    info_panel_w = label_w + bar_w + 2 * panel_pad + 8
+    info_panel_w = max(text_block_w, gmeter_block_w) + 2 * panel_pad
     info_panel_h = inner_h + 2 * panel_pad
     info_panel_x = canvas_w - info_panel_w - margin
     info_panel_y = canvas_h - info_panel_h - margin
@@ -373,18 +401,11 @@ def render_overlay_frame(args_tuple):
     draw.text((cx, cy), speed_text, font=font_speed, fill=(255, 255, 255, 245))
     cy += 36
 
-    if has_pedal:
-        cy += 4
-        thr = float(np.clip(frame_throttle, 0.0, 1.0))
-        draw.text((cx, cy + 1), "THR", font=font_label, fill=(160, 255, 100, 230))
-        _draw_pedal_bar(draw, cx + label_w, cy, bar_w, bar_h, thr,
-                        (10, 50, 10, 200), (60, 230, 20, 240))
-        cy += bar_row_h + 4
-
-        brk = float(np.clip(frame_brake, 0.0, 1.0))
-        draw.text((cx, cy + 1), "BRK", font=font_label, fill=(255, 140, 80, 230))
-        _draw_pedal_bar(draw, cx + label_w, cy, bar_w, bar_h, brk,
-                        (50, 10, 10, 200), (230, 50, 30, 240))
+    if has_imu:
+        cy += 8
+        gm_cx = info_panel_x + info_panel_w / 2
+        gm_cy = cy + gm_label_h_vert + gm_radius
+        _draw_gmeter(draw, gm_cx, gm_cy, gm_radius, frame_ax_g, frame_ay_g, gmeter_max_g, font_label)
 
     img.save(out_path)
     return out_path
@@ -404,10 +425,9 @@ def render_overlay_frames_parallel(
     map_tif=None,
     map_source="auto",
     allow_network_tiles=False,
-    throttle_vals=None,
-    throttle_times=None,
-    brake_vals=None,
-    brake_times=None,
+    accel_xy=None,
+    accel_times=None,
+    gmeter_max_g=1.0,
 ):
     frame_ts = np.asarray(frame_ts, dtype=np.float64)
     gps_xy = np.asarray(gps_xy, dtype=np.float64)
@@ -443,20 +463,18 @@ def render_overlay_frames_parallel(
     else:
         frame_speed = np.full(len(frame_ts), np.nan)
 
-    has_pedal = (
-        throttle_vals is not None and len(throttle_vals) >= 2
-        and throttle_times is not None and len(throttle_times) >= 2
-        and brake_vals is not None and len(brake_vals) >= 2
-        and brake_times is not None and len(brake_times) >= 2
+    has_imu = (
+        accel_xy is not None and len(accel_xy) >= 2
+        and accel_times is not None and len(accel_times) >= 2
     )
-    if has_pedal:
-        thr_max = max(float(np.percentile(throttle_vals, 99)), 1.0)
-        brk_max = max(float(np.percentile(brake_vals, 99)), 1.0)
-        frame_throttle = np.clip(np.interp(frame_ts, throttle_times, throttle_vals) / thr_max, 0.0, 1.0)
-        frame_brake = np.clip(np.interp(frame_ts, brake_times, brake_vals) / brk_max, 0.0, 1.0)
+    if has_imu:
+        accel_xy = np.asarray(accel_xy, dtype=np.float64)
+        accel_times = np.asarray(accel_times, dtype=np.float64)
+        frame_ax_g = np.interp(frame_ts, accel_times, accel_xy[:, 0]) / GRAVITY_MPS2
+        frame_ay_g = np.interp(frame_ts, accel_times, accel_xy[:, 1]) / GRAVITY_MPS2
     else:
-        frame_throttle = np.full(len(frame_ts), np.nan)
-        frame_brake = np.full(len(frame_ts), np.nan)
+        frame_ax_g = np.full(len(frame_ts), np.nan)
+        frame_ay_g = np.full(len(frame_ts), np.nan)
 
     if not np.isfinite(bag_start_time):
         bag_start_time = frame_ts[0]
@@ -472,8 +490,9 @@ def render_overlay_frames_parallel(
             idx,
             float(frame_speed[idx]),
             wall_time_strs[idx],
-            float(frame_throttle[idx]),
-            float(frame_brake[idx]),
+            float(frame_ax_g[idx]),
+            float(frame_ay_g[idx]),
+            gmeter_max_g,
             bg,
             route_px,
             frame_px,
@@ -509,10 +528,9 @@ def render_kitti_video_with_hud(
     allow_network_tiles=False,
     n_workers=None,
     cleanup_overlay_dir=True,
-    throttle_vals=None,
-    throttle_times=None,
-    brake_vals=None,
-    brake_times=None,
+    accel_xy=None,
+    accel_times=None,
+    gmeter_max_g=1.0,
     pip=None,
 ):
     """
@@ -568,10 +586,9 @@ def render_kitti_video_with_hud(
         map_tif=map_tif,
         map_source=map_source,
         allow_network_tiles=allow_network_tiles,
-        throttle_vals=throttle_vals,
-        throttle_times=throttle_times,
-        brake_vals=brake_vals,
-        brake_times=brake_times,
+        accel_xy=accel_xy,
+        accel_times=accel_times,
+        gmeter_max_g=gmeter_max_g,
     )
     rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir, pip=pip)
     if rendered and cleanup_overlay_dir and os.path.isdir(overlay_dir):
