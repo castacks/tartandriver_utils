@@ -602,12 +602,24 @@ def _pip_overlay_xy(pos, margin, cum):
     return f"main_w-overlay_w-{m + cum}", f"main_h-overlay_h-{m}"
 
 
-def _load_timestamps(dir_path):
-    """Load `dir_path/timestamps.txt` as a 1-D float array, or None if absent."""
+def _frame_index(path):
+    """Parse the zero-padded numeric index out of a `NNNNNNNN.png` path."""
+    return int(os.path.splitext(os.path.basename(path))[0])
+
+
+def _load_frame_timestamps(dir_path, files):
+    """Return per-file timestamps for `files`, looked up by each file's own numeric
+    index into `dir_path/timestamps.txt` (NOT by position in `files`) — the array in
+    that file is padded with -1 for any index never written, so a hole earlier in
+    the sequence must not shift every later file's timestamp. None if unavailable."""
     fp = os.path.join(dir_path, "timestamps.txt")
     if not os.path.exists(fp):
         return None
-    return np.atleast_1d(np.loadtxt(fp)).astype(np.float64)
+    raw = np.atleast_1d(np.loadtxt(fp)).astype(np.float64)
+    idxs = np.array([_frame_index(f) for f in files])
+    if idxs.max(initial=-1) >= len(raw):
+        return None
+    return raw[idxs]
 
 
 def _nearest_by_timestamp(src_ts, query_ts):
@@ -654,8 +666,8 @@ def _normalize_pip_specs(pip, n_frames, main_size, main_frame_ts=None, tmp_root=
             continue
 
         inset_dir = d
-        inset_ts = _load_timestamps(d)
-        if main_frame_ts is not None and inset_ts is not None and len(inset_ts) == len(insets):
+        inset_ts = _load_frame_timestamps(d, insets)
+        if main_frame_ts is not None and inset_ts is not None:
             inset_dir = _timestamp_align_dir(insets, inset_ts, main_frame_ts, tmp_root, f"pip{k}")
         elif len(insets) != n_frames:
             print(
@@ -721,10 +733,7 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
         output_path = frames_dir.rstrip(os.sep) + ".mp4"
 
     n_frames = len(pngs)
-    main_frame_ts = _load_timestamps(frames_dir)
-    if main_frame_ts is not None and len(main_frame_ts) != n_frames:
-        print(f"  [pip] main timestamp count mismatch ({len(main_frame_ts)} vs {n_frames} frames); pip alignment will use raw index.")
-        main_frame_ts = None
+    main_frame_ts = _load_frame_timestamps(frames_dir, pngs)
 
     if fps is None and main_frame_ts is not None and len(main_frame_ts) > 1:
         fps = float(1.0 / np.median(np.diff(main_frame_ts)))
