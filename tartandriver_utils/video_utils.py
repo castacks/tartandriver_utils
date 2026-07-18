@@ -602,15 +602,48 @@ def _pip_overlay_xy(pos, margin, cum):
     return f"main_w-overlay_w-{m + cum}", f"main_h-overlay_h-{m}"
 
 
-def _normalize_pip_specs(pip, n_frames, main_size):
+def _load_timestamps(dir_path):
+    """Load `dir_path/timestamps.txt` as a 1-D float array, or None if absent."""
+    fp = os.path.join(dir_path, "timestamps.txt")
+    if not os.path.exists(fp):
+        return None
+    return np.atleast_1d(np.loadtxt(fp)).astype(np.float64)
+
+
+def _nearest_by_timestamp(src_ts, query_ts):
+    """For each time in `query_ts`, return the index into `src_ts` of its nearest neighbor."""
+    order = np.argsort(src_ts)
+    src_sorted = src_ts[order]
+    right = np.clip(np.searchsorted(src_sorted, query_ts), 0, len(src_sorted) - 1)
+    left = np.clip(right - 1, 0, len(src_sorted) - 1)
+    use_left = np.abs(src_sorted[left] - query_ts) < np.abs(src_sorted[right] - query_ts)
+    return order[np.where(use_left, left, right)]
+
+
+def _timestamp_align_dir(inset_files, inset_ts, main_ts, tmp_root, name):
+    """Symlink inset frames into `tmp_root/name/%08d.png` so index i is the inset capture nearest in real time to main frame i (not just index i)."""
+    aligned_dir = os.path.join(tmp_root, name)
+    os.makedirs(aligned_dir, exist_ok=True)
+    nearest = _nearest_by_timestamp(inset_ts, main_ts)
+    for out_i, src_i in enumerate(nearest):
+        dst = os.path.join(aligned_dir, f"{out_i:08d}.png")
+        if os.path.lexists(dst):
+            os.remove(dst)
+        os.symlink(os.path.abspath(inset_files[src_i]), dst)
+    return aligned_dir
+
+
+def _normalize_pip_specs(pip, n_frames, main_size, main_frame_ts=None, tmp_root=None):
     """Validate + normalize PiP inset specs, dropping insets that don't exist in
-    the dataset or whose frame count doesn't match the main video.
+    the dataset, and re-indexing each inset's frames to align with the main
+    video's frame timestamps (nearest capture time) rather than assuming file
+    index N in the inset represents the same instant as file index N in main.
     """
     if not pip:
         return []
     W, _H = main_size
     valid = []
-    for spec in pip:
+    for k, spec in enumerate(pip):
         d = spec.get("dir")
         if not d or not os.path.isdir(d):
             print(f"  [pip] inset dir missing, skipping: {d}")
@@ -619,17 +652,25 @@ def _normalize_pip_specs(pip, n_frames, main_size):
         if not insets:
             print(f"  [pip] no frames in inset dir, skipping: {d}")
             continue
-        if len(insets) != n_frames:
+
+        inset_dir = d
+        inset_ts = _load_timestamps(d)
+        if main_frame_ts is not None and inset_ts is not None and len(inset_ts) == len(insets):
+            inset_dir = _timestamp_align_dir(insets, inset_ts, main_frame_ts, tmp_root, f"pip{k}")
+        elif len(insets) != n_frames:
             print(
-                f"  [pip] inset frame count mismatch ({len(insets)} vs {n_frames}) "
-                f"for {d}; skipping inset."
+                f"  [pip] inset frame count mismatch ({len(insets)} vs {n_frames}) and no "
+                f"timestamps available to align; skipping inset: {d}"
             )
             continue
+        else:
+            print(f"  [pip] no timestamps available for {d}; falling back to raw index alignment (not time-synced).")
+
         pw = max(2, int(round(W * float(spec.get("scale", 0.25)))))
         if pw % 2:
             pw += 1
         valid.append({
-            "dir": d,
+            "dir": inset_dir,
             "pw": pw,
             "pos": spec.get("pos", "bottom-right"),
             "margin": int(spec.get("margin", 16)),
@@ -679,17 +720,17 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
     if output_path is None:
         output_path = frames_dir.rstrip(os.sep) + ".mp4"
 
-    if fps is None:
-        timestamps_fp = os.path.join(frames_dir, "timestamps.txt")
-        if os.path.exists(timestamps_fp):
-            ts = np.loadtxt(timestamps_fp)
-            if ts.ndim == 1 and len(ts) > 1:
-                fps = float(1.0 / np.median(np.diff(ts)))
+    n_frames = len(pngs)
+    main_frame_ts = _load_timestamps(frames_dir)
+    if main_frame_ts is not None and len(main_frame_ts) != n_frames:
+        print(f"  [pip] main timestamp count mismatch ({len(main_frame_ts)} vs {n_frames} frames); pip alignment will use raw index.")
+        main_frame_ts = None
+
+    if fps is None and main_frame_ts is not None and len(main_frame_ts) > 1:
+        fps = float(1.0 / np.median(np.diff(main_frame_ts)))
 
     if fps is None or fps <= 0:
         fps = 10.0
-
-    n_frames = len(pngs)
 
     # %{eif\:n+1\:d} is ffmpeg's evaluate-integer-format for 1-indexed frame number
     drawtext = (
@@ -717,10 +758,14 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
     has_overlay = overlay_dir is not None
 
     pip_specs = []
+    pip_tmp_root = None
     if pip:
         with Image.open(pngs[0]) as _img:
             main_size = _img.size
-        pip_specs = _normalize_pip_specs(pip, n_frames, main_size)
+        pip_tmp_root = os.path.join(os.path.dirname(output_path) or ".",
+                                    ".pip_tmp_" + os.path.splitext(os.path.basename(output_path))[0])
+        pip_specs = _normalize_pip_specs(pip, n_frames, main_size,
+                                         main_frame_ts=main_frame_ts, tmp_root=pip_tmp_root)
 
     if has_overlay or pip_specs:
         input_offset = 1
@@ -767,23 +812,27 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
 
     label = os.path.basename(output_path) if output_path else os.path.basename(frames_dir)
     stderr_lines = []
-    with tqdm.tqdm(total=n_frames, desc=label, unit="frame") as pbar:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        current = 0
-        for line in proc.stdout:
-            if line.startswith("frame="):
-                try:
-                    frame = int(line.split("=", 1)[1].strip())
-                    pbar.update(frame - current)
-                    current = frame
-                except ValueError:
-                    pass
-        _, stderr_out = proc.communicate()
-        stderr_lines = stderr_out
+    try:
+        with tqdm.tqdm(total=n_frames, desc=label, unit="frame") as pbar:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            current = 0
+            for line in proc.stdout:
+                if line.startswith("frame="):
+                    try:
+                        frame = int(line.split("=", 1)[1].strip())
+                        pbar.update(frame - current)
+                        current = frame
+                    except ValueError:
+                        pass
+            _, stderr_out = proc.communicate()
+            stderr_lines = stderr_out
 
-    if proc.returncode != 0:
-        print(f"  [video] ERROR rendering {frames_dir}:\n{stderr_lines[-500:]}")
-        return None
+        if proc.returncode != 0:
+            print(f"  [video] ERROR rendering {frames_dir}:\n{stderr_lines[-500:]}")
+            return None
 
-    print(f"  [video] rendered: {output_path}")
-    return output_path
+        print(f"  [video] rendered: {output_path}")
+        return output_path
+    finally:
+        if pip_tmp_root and os.path.isdir(pip_tmp_root):
+            shutil.rmtree(pip_tmp_root, ignore_errors=True)
