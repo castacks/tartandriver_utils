@@ -64,6 +64,58 @@ def traj_to_o3d(traj, color=[0., 0., 0.]):
 
     return out
 
+def traj_to_o3d_2d(traj, z=0.0, color=[0., 0., 0.]):
+    if isinstance(traj, torch.Tensor):
+        return traj_to_o3d_2d(traj.detach().cpu().numpy(), z=z, color=color)
+
+    xy = traj[:, :2]
+    zs = np.full((xy.shape[0], 1), z) if np.isscalar(z) else np.asarray(z).reshape(-1, 1)
+    pts = np.concatenate([xy, zs], axis=-1)
+
+    adj = np.stack([
+        np.arange(pts.shape[0]-1),
+        np.arange(1, pts.shape[0])
+    ], axis=-1)
+
+    out = o3d.geometry.LineSet()
+    out.points = o3d.utility.Vector3dVector(pts)
+    out.lines = o3d.utility.Vector2iVector(adj)
+    out.paint_uniform_color(color)
+    return out
+
+def traj_to_o3d_tube_2d(traj, z=0.0, color=[0., 0., 0.], radius=0.05):
+    if isinstance(traj, torch.Tensor):
+        return traj_to_o3d_tube_2d(traj.detach().cpu().numpy(), z=z, color=color, radius=radius)
+
+    xy = traj[:, :2]
+    zs = np.full((xy.shape[0], 1), z) if np.isscalar(z) else np.asarray(z).reshape(-1, 1)
+    pts = np.concatenate([xy, zs], axis=-1)
+
+    meshes = []
+    for i in range(len(pts) - 1):
+        p0, p1 = pts[i], pts[i+1]
+        vec = p1 - p0
+        length = np.linalg.norm(vec)
+        if length < 1e-8:
+            continue
+
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=length, resolution=8)
+        # cylinder defaults to +z axis; rotate to align with vec
+        axis = np.cross([0, 0, 1], vec / length)
+        angle = np.arccos(np.clip(np.dot([0, 0, 1], vec / length), -1, 1))
+        if np.linalg.norm(axis) > 1e-8:
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis / np.linalg.norm(axis) * angle)
+            cyl.rotate(R, center=(0, 0, 0))
+        cyl.translate((p0 + p1) / 2)
+        meshes.append(cyl)
+
+    out = meshes[0]
+    for m in meshes[1:]:
+        out += m
+    out.paint_uniform_color(color)
+    out.compute_vertex_normals()
+    return out
+
 def get_atv_mesh(fp='/home/tartandriver/tartandriver_ws/src/core/tartandriver_utils/atv_mesh/textured.obj', origin='rear_axle'):
     """
     Load the ATV mesh into open3d for viz. Note that the ATV will be transformed such that
@@ -91,6 +143,9 @@ def get_atv_mesh(fp='/home/tartandriver/tartandriver_ws/src/core/tartandriver_ut
     return mesh.transform(H)
 
 def make_bev_mesh(metadata, height, mask, colors):
+    if height is None:
+        height = torch.zeros(int(metadata.N[0]), int(metadata.N[1]), device=metadata.origin.device)
+
     xy_coords = metadata.get_coords()
     coords = torch.cat([xy_coords, height.unsqueeze(-1)], dim=-1)
 
@@ -141,5 +196,47 @@ def make_bev_mesh(metadata, height, mask, colors):
     mesh.triangles = o3d.utility.Vector3iVector(adjs.cpu().numpy().reshape(-1, 3))
 
     # mesh.compute_vertex_normals()
+
+    return mesh
+
+def make_voxel_mesh(centers, resolution, colors, z_scale=1.):
+    """
+    Build a mesh of solid (possibly anisotropic) cuboids, one per voxel. Unlike o3d.geometry.VoxelGrid
+    (which only supports a single uniform voxel_size), this supports the [x,y,z] resolution used by
+    physics_atv_visual_mapping's VoxelGrid, e.g. flat 0.4x0.4x0.1 voxels.
+
+    Args:
+        centers: [N,3] voxel centers, world coords
+        resolution: [3] voxel extent along x,y,z
+        colors: [N,3] per-voxel color in [0,1]
+        z_scale: cosmetic exaggeration of voxel height only (doesn't move voxel centers), useful for
+            flat voxels (e.g. 0.1m z-res) that otherwise render as near-invisible slivers
+    """
+    corner_signs = torch.tensor([
+        [-1.,-1.,-1.], [ 1.,-1.,-1.], [ 1., 1.,-1.], [-1., 1.,-1.],
+        [-1.,-1., 1.], [ 1.,-1., 1.], [ 1., 1., 1.], [-1., 1., 1.],
+    ], device=centers.device)
+
+    resolution = resolution * torch.tensor([1., 1., z_scale], device=resolution.device)
+    vertices = centers.view(-1, 1, 3) + 0.5 * corner_signs.view(1, 8, 3) * resolution.view(1, 1, 3) #[N,8,3]
+
+    tris_local = torch.tensor([
+        [0,2,1], [0,3,2], #bottom
+        [4,5,6], [4,6,7], #top
+        [0,1,5], [0,5,4], #front
+        [3,6,2], [3,7,6], #back
+        [0,4,7], [0,7,3], #left
+        [1,2,6], [1,6,5], #right
+    ], device=centers.device)
+
+    base_dxs = (torch.arange(centers.shape[0], device=centers.device) * 8).view(-1, 1, 1)
+    triangles = base_dxs + tris_local.view(1, 12, 3) #[N,12,3]
+
+    vertex_colors = colors.view(-1, 1, 3).tile(1, 8, 1) #[N,8,3]
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices.cpu().numpy().reshape(-1, 3))
+    mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors.cpu().numpy().reshape(-1, 3))
+    mesh.triangles = o3d.utility.Vector3iVector(triangles.cpu().numpy().reshape(-1, 3))
 
     return mesh
