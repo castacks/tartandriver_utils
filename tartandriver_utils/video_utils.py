@@ -76,6 +76,8 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom",
         "speed_times": np.zeros((0,), dtype=np.float64),
         "quat_xyzw": np.zeros((0, 4), dtype=np.float64),
         "quat_times": np.zeros((0,), dtype=np.float64),
+        "vel_xy": np.zeros((0, 2), dtype=np.float64),
+        "vel_times": np.zeros((0,), dtype=np.float64),
         "bag_start_time": np.nan,
     }
 
@@ -104,6 +106,8 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom",
         "speed_times": times,
         "quat_xyzw": data[:, 3:7],  # (x, y, z, w) vehicle orientation
         "quat_times": times,
+        "vel_xy": data[:, 7:9],  # world-frame vx, vy -- for the minimap heading arrow
+        "vel_times": times,
         "bag_start_time": np.nan,
     }
 
@@ -648,6 +652,7 @@ def render_overlay_frame(args_tuple):
         map_background,
         route_px,
         frame_px,
+        heading_px_dir,
         canvas_size,
         map_size,
         out_path,
@@ -692,11 +697,8 @@ def render_overlay_frame(args_tuple):
                 [pos[0] - radius, pos[1] - radius, pos[0] + radius, pos[1] + radius],
                 fill=(255, 218, 66, 255), outline=(0, 0, 0, 180), width=2,
             )
-            prev_idx = max(0, min(frame_idx, len(frame_px) - 1) - 3)
-            delta = pos - frame_px[prev_idx]
-            if np.linalg.norm(delta) > 1e-3 and np.isfinite(delta).all():
-                direction = delta / np.linalg.norm(delta)
-                end = pos + direction * 18
+            if heading_px_dir is not None and np.isfinite(heading_px_dir).all():
+                end = pos + np.asarray(heading_px_dir) * 18
                 map_draw.line([tuple(pos), tuple(end)], fill=(255, 218, 66, 255), width=3)
 
     img.alpha_composite(minimap, dest=(map_x, map_y))
@@ -786,6 +788,9 @@ def render_overlay_frames_parallel(
     quat_xyzw=None,
     quat_times=None,
     orient_cfg=None,
+    vel_xy=None,
+    vel_times=None,
+    heading_min_speed=0.15,
 ):
     frame_ts = np.asarray(frame_ts, dtype=np.float64)
     gps_xy = np.asarray(gps_xy, dtype=np.float64)
@@ -797,24 +802,65 @@ def render_overlay_frames_parallel(
         return None
 
     os.makedirs(overlay_dir, exist_ok=True)
+
+    # Heading arrow direction: derived from the *velocity vector* (already smooth
+    # -- it's a per-sample RBState field, not something we differentiate ourselves)
+    # rather than differencing consecutive rendered-frame positions. At low speed a
+    # few-frame position delta is sub-pixel on the minimap, so that approach was
+    # noise-dominated and the arrow would swing wildly frame to frame.
+    has_vel = (
+        vel_xy is not None and len(vel_xy) >= 2
+        and vel_times is not None and len(vel_times) >= 2
+    )
+    heading_world_dir = None
+    if has_vel:
+        vel_xy = np.asarray(vel_xy, dtype=np.float64)
+        vel_times = np.asarray(vel_times, dtype=np.float64)
+        frame_vx = np.interp(frame_ts, vel_times, vel_xy[:, 0])
+        frame_vy = np.interp(frame_ts, vel_times, vel_xy[:, 1])
+        frame_vspeed = np.hypot(frame_vx, frame_vy)
+        heading_world_dir = np.column_stack([frame_vx, frame_vy]) / np.clip(frame_vspeed, 1e-9, None)[:, None]
+        heading_world_dir[frame_vspeed < heading_min_speed] = np.nan
+
     if len(gps_xy) >= 2 and len(gps_times) >= 2:
         frame_x = np.interp(frame_ts, gps_times, gps_xy[:, 0])
         frame_y = np.interp(frame_ts, gps_times, gps_xy[:, 1])
         frame_xy = np.column_stack([frame_x, frame_y])
-        bg, route_px, frame_px, north_available = _load_minimap_background(
+
+        # Project a small lookahead point alongside each frame position so the
+        # heading arrow comes out in whatever pixel space the minimap ends up
+        # using (track view or GeoTIFF), instead of assuming a meter->pixel scale.
+        lookahead_xy = frame_xy.copy()
+        if heading_world_dir is not None:
+            finite = np.isfinite(heading_world_dir).all(axis=1)
+            lookahead_xy[finite] = frame_xy[finite] + heading_world_dir[finite] * 2.0
+
+        combined_xy = np.vstack([frame_xy, lookahead_xy])
+        bg, route_px, combined_px, north_available = _load_minimap_background(
             gps_xy,
             map_tif=map_tif,
             map_source=map_source,
             map_size=map_size,
             cache_dir=os.path.join(os.path.dirname(overlay_dir), "map_cache"),
             allow_network_tiles=allow_network_tiles,
-            frame_xy=frame_xy,
+            frame_xy=combined_xy,
         )
+        n = len(frame_ts)
+        frame_px = combined_px[:n]
+        lookahead_px = combined_px[n:]
+        heading_px_dir = lookahead_px - frame_px
+        hnorm = np.linalg.norm(heading_px_dir, axis=1, keepdims=True)
+        heading_px_dir = np.divide(heading_px_dir, hnorm, out=np.full_like(heading_px_dir, np.nan), where=hnorm > 1e-6)
+        if heading_world_dir is not None:
+            heading_px_dir[~np.isfinite(heading_world_dir).all(axis=1)] = np.nan
+        else:
+            heading_px_dir[:] = np.nan
     else:
         map_w, map_h = _as_map_size(map_size)
         bg = Image.new("RGBA", (map_w, map_h), (26, 26, 46, 235))
         route_px = np.zeros((0, 2), dtype=np.float64)
         frame_px = None
+        heading_px_dir = None
         north_available = False
 
     if len(speed_mps) >= 1 and len(speed_times) >= 1:
@@ -894,6 +940,7 @@ def render_overlay_frames_parallel(
             bg,
             route_px,
             frame_px,
+            heading_px_dir[idx] if heading_px_dir is not None else None,
             tuple(canvas_size),
             map_size,
             os.path.join(overlay_dir, f"{idx:08d}.png"),
@@ -933,6 +980,8 @@ def render_kitti_video_with_hud(
     quat_xyzw=None,
     quat_times=None,
     orient_cfg=None,
+    vel_xy=None,
+    vel_times=None,
     pip=None,
 ):
     """
@@ -999,6 +1048,8 @@ def render_kitti_video_with_hud(
         quat_xyzw=quat_xyzw,
         quat_times=quat_times,
         orient_cfg=orient_cfg,
+        vel_xy=vel_xy,
+        vel_times=vel_times,
     )
     rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir, pip=pip)
     if rendered and cleanup_overlay_dir and os.path.isdir(overlay_dir):
@@ -1356,6 +1407,8 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
                 quat_xyzw=hud_data.get("quat_xyzw"),
                 quat_times=hud_data.get("quat_times"),
                 orient_cfg=hud["orient"],
+                vel_xy=hud_data.get("vel_xy"),
+                vel_times=hud_data.get("vel_times"),
                 pip=pip,
             )
         else:
