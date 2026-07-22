@@ -41,37 +41,62 @@ def load_video_config(path):
     return {"hud": hud, "pip": cfg.get("pip", []) or []}
 
 
-def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
+def _load_interp_rbstate(dataset_dir, sub_dir):
+    """Load an INTERP-type RBState's `interp_data.txt`/`interp_timestamps.txt`
+    (13 cols: x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz). None if the dir is missing.
     """
-    Collect meter-frame odometry and speed for HUD overlays
-
-    OdomRBState is a TimeSpec.INTERP type: `data.txt`/`timestamps.txt` only get a
-    row when a message happens to land at the exact stamp of a reference frame
-    (near-never for a different sensor's clock), so they're almost entirely
-    `inf`/-1 filler (see rb_state.py's save_to_file). The real, complete stream
-    lives in `interp_data.txt`/`interp_timestamps.txt` -- same column layout,
-    written once via to_interp -- which is what every other INTERP consumer
-    (transform.py, command.py, racepak.py, etc.) reads.
-    """
-    base_dir = os.path.join(dataset_dir, odom_dir)
+    base_dir = os.path.join(dataset_dir, sub_dir)
     data_fp = os.path.join(base_dir, "interp_data.txt")
     ts_fp = os.path.join(base_dir, "interp_timestamps.txt")
-
     if not (os.path.exists(data_fp) and os.path.exists(ts_fp)):
-        print(f"  [hud] odom dir not found: {base_dir}; rendering timestamp-only HUD")
-        return {
-            "gps_xy": np.zeros((0, 2), dtype=np.float64),
-            "gps_times": np.zeros((0,), dtype=np.float64),
-            "speed_mps": np.zeros((0,), dtype=np.float64),
-            "speed_times": np.zeros((0,), dtype=np.float64),
-            "quat_xyzw": np.zeros((0, 4), dtype=np.float64),
-            "quat_times": np.zeros((0,), dtype=np.float64),
-            "bag_start_time": np.nan,
-        }
-
+        return None
     data = np.loadtxt(data_fp).reshape(-1, 13)
     times = np.atleast_1d(np.loadtxt(ts_fp)).astype(np.float64)
+    return data, times
 
+
+def _is_frozen_pose(data, tol=1e-3):
+    """True if position+orientation never change -- e.g. GPS never got a fix
+    (common under dense canopy for this off-road stack), as opposed to a
+    genuinely stationary vehicle, which still has sensor-noise-scale jitter."""
+    if len(data) < 2:
+        return True
+    return bool(np.ptp(data[:, :7], axis=0).max() < tol)
+
+
+def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom",
+                           fallback_odom_dir="super_odometry/odometry"):
+    """
+    Collect meter-frame odometry and speed for HUD overlays.
+    """
+    empty = {
+        "gps_xy": np.zeros((0, 2), dtype=np.float64),
+        "gps_times": np.zeros((0,), dtype=np.float64),
+        "speed_mps": np.zeros((0,), dtype=np.float64),
+        "speed_times": np.zeros((0,), dtype=np.float64),
+        "quat_xyzw": np.zeros((0, 4), dtype=np.float64),
+        "quat_times": np.zeros((0,), dtype=np.float64),
+        "bag_start_time": np.nan,
+    }
+
+    loaded = _load_interp_rbstate(dataset_dir, odom_dir)
+    if loaded is None:
+        print(f"  [hud] odom dir not found: {os.path.join(dataset_dir, odom_dir)}")
+    elif _is_frozen_pose(loaded[0]):
+        print(f"  [hud] {odom_dir} position+orientation never change (GPS likely never got a "
+              f"fix); falling back to {fallback_odom_dir}")
+        loaded = None
+
+    if loaded is None and fallback_odom_dir:
+        loaded = _load_interp_rbstate(dataset_dir, fallback_odom_dir)
+        if loaded is None:
+            print(f"  [hud] fallback odom dir not found: {os.path.join(dataset_dir, fallback_odom_dir)}; "
+                  "rendering timestamp-only HUD")
+
+    if loaded is None:
+        return empty
+
+    data, times = loaded
     return {
         "gps_xy": data[:, :2],
         "gps_times": times,
