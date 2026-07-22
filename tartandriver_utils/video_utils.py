@@ -44,10 +44,18 @@ def load_video_config(path):
 def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
     """
     Collect meter-frame odometry and speed for HUD overlays
+
+    OdomRBState is a TimeSpec.INTERP type: `data.txt`/`timestamps.txt` only get a
+    row when a message happens to land at the exact stamp of a reference frame
+    (near-never for a different sensor's clock), so they're almost entirely
+    `inf`/-1 filler (see rb_state.py's save_to_file). The real, complete stream
+    lives in `interp_data.txt`/`interp_timestamps.txt` -- same column layout,
+    written once via to_interp -- which is what every other INTERP consumer
+    (transform.py, command.py, racepak.py, etc.) reads.
     """
     base_dir = os.path.join(dataset_dir, odom_dir)
-    data_fp = os.path.join(base_dir, "data.txt")
-    ts_fp = os.path.join(base_dir, "timestamps.txt")
+    data_fp = os.path.join(base_dir, "interp_data.txt")
+    ts_fp = os.path.join(base_dir, "interp_timestamps.txt")
 
     if not (os.path.exists(data_fp) and os.path.exists(ts_fp)):
         print(f"  [hud] odom dir not found: {base_dir}; rendering timestamp-only HUD")
@@ -78,10 +86,14 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
 def collect_video_hud_imu(dataset_dir, imu_dir="sensors/novatel_imu"):
     """
     Collect body-frame linear acceleration (x, y) for the HUD g-meter
+
+    Imu is also TimeSpec.INTERP -- see the note in collect_video_hud_odom for why
+    this must read interp_data.txt/interp_timestamps.txt rather than data.txt/
+    timestamps.txt.
     """
     base_dir = os.path.join(dataset_dir, imu_dir)
-    data_fp = os.path.join(base_dir, "data.txt")
-    ts_fp = os.path.join(base_dir, "timestamps.txt")
+    data_fp = os.path.join(base_dir, "interp_data.txt")
+    ts_fp = os.path.join(base_dir, "interp_timestamps.txt")
 
     if not (os.path.exists(data_fp) and os.path.exists(ts_fp)):
         print(f"  [hud] imu dir not found: {base_dir}; g-meter HUD disabled")
