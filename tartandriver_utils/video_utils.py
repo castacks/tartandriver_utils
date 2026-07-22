@@ -25,10 +25,13 @@ def load_video_config(path):
     hud = None
     hud_cfg = cfg.get("hud")
     if hud_cfg and hud_cfg.get("enabled", True):
+        orient_cfg = hud_cfg.get("orient") or {}
         hud = {
             "odom_kitti_dir": hud_cfg.get("odom_kitti_dir", "sensors/novatel_gps_odom"),
             "imu_kitti_dir": hud_cfg.get("imu_kitti_dir", "sensors/novatel_imu"),
             "gmeter_max_g": hud_cfg.get("gmeter_max_g", 1.0),
+            "gmeter_trail": hud_cfg.get("gmeter_trail", 15),
+            "orient": {"enabled": orient_cfg.get("enabled", True)},
             "map_tif": hud_cfg.get("map_tif"),
             "map_source": hud_cfg.get("map_source", "auto"),
             "allow_network_tiles": hud_cfg.get("allow_network_tiles", False),
@@ -53,6 +56,8 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
             "gps_times": np.zeros((0,), dtype=np.float64),
             "speed_mps": np.zeros((0,), dtype=np.float64),
             "speed_times": np.zeros((0,), dtype=np.float64),
+            "quat_xyzw": np.zeros((0, 4), dtype=np.float64),
+            "quat_times": np.zeros((0,), dtype=np.float64),
             "bag_start_time": np.nan,
         }
 
@@ -64,6 +69,8 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
         "gps_times": times,
         "speed_mps": np.linalg.norm(data[:, 7:10], axis=1),
         "speed_times": times,
+        "quat_xyzw": data[:, 3:7],  # (x, y, z, w) vehicle orientation
+        "quat_times": times,
         "bag_start_time": np.nan,
     }
 
@@ -258,7 +265,8 @@ def _project_route_on_tif(gps_xy, frame_xy, map_tif, map_size):
             (np.asarray(frame_rows, dtype=np.float64) - r0) * scale_y,
         ])
 
-    return bg, route_px, frame_px
+    # The rowcol() call above maps odom +x -> geographic north (odom +y -> west),
+    return bg, route_px, frame_px, True
 
 
 def _load_minimap_background(
@@ -299,51 +307,284 @@ def _load_minimap_background(
     frame_px = None
     if frame_xy is not None and len(frame_xy):
         frame_px = _apply_route_projection(frame_xy, scale, offset)
-    return bg, route_px, frame_px
+    return bg, route_px, frame_px, False
 
 
-def _draw_gmeter(draw, cx, cy, radius, ax_g, ay_g, max_g, font_label):
-    """Circular accelerometer g-meter, racing-dashboard style.
+def _draw_gmeter(draw, cx, cy, radius, trail_ax_g, trail_ay_g, max_g, font_label):
+    """Circular accelerometer g-meter with a fixed scale and a fading trail.
 
-    ax_g is longitudinal g (+forward/accel, -rearward/brake), ay_g is lateral g
-    (+left, -right, REP-103 body frame). The dot's position is the (ay, ax)
-    vector clipped to the dial; readouts at 12/3/6/9 o'clock show the current
-    accel/right/brake/left magnitude (each >= 0, 0 outside that phase).
+    trail_ax_g/trail_ay_g are sequences of recent longitudinal/lateral g samples
+    (oldest -> newest; the last element is the current frame), REP-103 body frame
+    (+ax forward, +ay left). The dial has fixed rings at each integer g up to
+    max_g -- the only numbers shown are those fixed limits (no dynamic readouts).
+    The current accel vector (ay, ax) is a solid dot; older samples fade out.
     """
-    ring_color = (255, 255, 255, 60)
-    axis_color = (255, 255, 255, 90)
-    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
-                 outline=ring_color, width=1)
-    draw.ellipse([cx - radius / 2, cy - radius / 2, cx + radius / 2, cy + radius / 2],
-                 outline=ring_color, width=1)
-    draw.line([cx - radius, cy, cx + radius, cy], fill=axis_color, width=1)
-    draw.line([cx, cy - radius, cx, cy + radius], fill=axis_color, width=1)
+    minor_ring = (255, 255, 255, 30)
+    major_ring = (255, 255, 255, 78)
+    spoke_col = (255, 255, 255, 26)
+    axis_col = (255, 255, 255, 70)
+    diag = 0.70710678  # cos/sin 45deg
 
-    if np.isfinite(ax_g) and np.isfinite(ay_g):
+    # Radial spokes (8 directions) + brighter primary cross, for angular reference.
+    for dx, dy in [(diag, diag), (diag, -diag)]:
+        draw.line([cx - dx * radius, cy - dy * radius, cx + dx * radius, cy + dy * radius],
+                  fill=spoke_col, width=1)
+    draw.line([cx - radius, cy, cx + radius, cy], fill=axis_col, width=1)
+    draw.line([cx, cy - radius, cx, cy + radius], fill=axis_col, width=1)
+
+    # Concentric rings every 0.5g: minor faint (inner circles), integer g major.
+    g = 0.5
+    while g < max_g - 1e-6:
+        rr = radius * (g / max_g)
+        is_major = abs(g - round(g)) < 1e-6
+        draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                     outline=major_ring if is_major else minor_ring, width=1)
+        if is_major:  # label sits just outside its ring on the up-right diagonal
+            lr = rr + 8
+            draw.text((cx + lr * diag, cy - lr * diag), f"{g:g}g", font=font_label,
+                      fill=(195, 195, 195, 210), anchor="mm")
+        g += 0.5
+
+    # Outer full-scale ring + label just outside it.
+    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], outline=major_ring, width=1)
+    lr = radius + 9
+    draw.text((cx + lr * diag, cy - lr * diag), f"{max_g:g}g", font=font_label,
+              fill=(215, 215, 215, 225), anchor="mm")
+
+    # Tick marks around the outer ring every 30deg.
+    for k in range(12):
+        a = math.radians(30 * k)
+        ca, sa = math.cos(a), math.sin(a)
+        draw.line([cx + radius * ca, cy - radius * sa,
+                   cx + (radius - 4) * ca, cy - (radius - 4) * sa],
+                  fill=axis_col, width=1)
+
+    draw.ellipse([cx - 1.5, cy - 1.5, cx + 1.5, cy + 1.5], fill=(255, 255, 255, 120))
+
+    trail_ax_g = np.atleast_1d(np.asarray(trail_ax_g, dtype=np.float64))
+    trail_ay_g = np.atleast_1d(np.asarray(trail_ay_g, dtype=np.float64))
+    n = int(min(len(trail_ax_g), len(trail_ay_g)))
+    for i in range(n):
+        ax_g = trail_ax_g[i]
+        ay_g = trail_ay_g[i]
+        if not (np.isfinite(ax_g) and np.isfinite(ay_g)):
+            continue
         mag = math.hypot(ax_g, ay_g)
         scale = radius / max_g if mag <= max_g else radius / max(mag, 1e-6)
         dot_x = cx - ay_g * scale
         dot_y = cy - ax_g * scale
-        r = 5
-        draw.ellipse([dot_x - r, dot_y - r, dot_x + r, dot_y + r],
-                     fill=(255, 90, 90, 235), outline=(0, 0, 0, 180), width=1)
-    else:
-        ax_g = ay_g = 0.0
+        frac = (i + 1) / n  # oldest -> newest
+        if i == n - 1:
+            r = 5
+            draw.ellipse([dot_x - r, dot_y - r, dot_x + r, dot_y + r],
+                         fill=(255, 90, 90, 235), outline=(0, 0, 0, 180), width=1)
+        else:
+            r = 1.5 + 2.5 * frac
+            alpha = int(30 + 150 * frac)
+            draw.ellipse([dot_x - r, dot_y - r, dot_x + r, dot_y + r],
+                         fill=(255, 140, 120, alpha))
 
-    accel_g = max(ax_g, 0.0)
-    brake_g = max(-ax_g, 0.0)
-    right_g = max(-ay_g, 0.0)
-    left_g = max(ay_g, 0.0)
 
-    label_pad = 6
-    labels = [
-        (f"{accel_g:.2f}g", (cx, cy - radius - label_pad), "ms", (160, 255, 100, 230)),
-        (f"{brake_g:.2f}g", (cx, cy + radius + label_pad), "mt", (255, 110, 90, 230)),
-        (f"{right_g:.2f}g", (cx + radius + label_pad, cy), "lm", (120, 200, 255, 230)),
-        (f"{left_g:.2f}g", (cx - radius - label_pad, cy), "rm", (120, 200, 255, 230)),
+_VEHICLE_MESH_CACHE = {}
+
+
+def _make_box(x0, x1, y0, y1, z0, z1):
+    """8-vertex box with 12 outward-wound triangles (forward=+x, left=+y, up=+z)."""
+    v = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+    ], dtype=np.float64)
+    f = np.array([
+        [0, 3, 2], [0, 2, 1],   # bottom (-z)
+        [4, 5, 6], [4, 6, 7],   # top (+z)
+        [0, 1, 5], [0, 5, 4],   # -y
+        [3, 6, 2], [3, 7, 6],   # +y  (fixed winding)
+        [1, 2, 6], [1, 6, 5],   # +x
+        [0, 4, 7], [0, 7, 3],   # -x
+    ], dtype=np.int64)
+    return v, f
+
+
+def _make_wheel(cx, cy, cz, r, hw, nseg=10):
+    """Octagon-ish prism (axle along y) for a wheel."""
+    ang = np.linspace(0.0, 2 * np.pi, nseg, endpoint=False)
+    ring = np.column_stack([np.cos(ang) * r, np.zeros(nseg), np.sin(ang) * r])
+    left = ring + np.array([cx, cy + hw, cz])
+    right = ring + np.array([cx, cy - hw, cz])
+    v = np.vstack([left, right])
+    f = []
+    for i in range(nseg):
+        j = (i + 1) % nseg
+        f.append([i, j, nseg + j])
+        f.append([i, nseg + j, nseg + i])
+    for i in range(1, nseg - 1):
+        f.append([0, i, i + 1])                    # left cap
+        f.append([nseg, nseg + i + 1, nseg + i])   # right cap
+    return v, np.array(f, dtype=np.int64)
+
+
+def _stylized_vehicle_mesh():
+    """A clean low-poly car (chassis + cabin + 4 wheels), forward=+x, with
+    per-face colors. Reads far better than a decimated photogrammetry scan."""
+    parts_v, parts_f, parts_c = [], [], []
+    offset = 0
+
+    def add(v, f, color):
+        nonlocal offset
+        parts_v.append(v)
+        parts_f.append(f + offset)
+        parts_c.append(np.tile(np.asarray(color, dtype=np.float64), (len(f), 1)))
+        offset += len(v)
+
+    body_c = (64, 122, 192)
+    cabin_c = (150, 186, 226)
+    wheel_c = (38, 38, 46)
+
+    add(*_make_box(-1.0, 1.0, -0.5, 0.5, 0.18, 0.55), color=body_c)      # chassis
+    add(*_make_box(-0.55, 0.35, -0.42, 0.42, 0.55, 0.92), color=cabin_c)  # cabin (rear-biased)
+    add(*_make_box(0.72, 1.02, -0.46, 0.46, 0.22, 0.42), color=body_c)    # hood/nose (front stub)
+    for wx, wy in [(0.62, 0.52), (0.62, -0.52), (-0.62, 0.52), (-0.62, -0.52)]:
+        add(*_make_wheel(wx, wy, 0.16, 0.34, 0.14), color=wheel_c)
+
+    verts = np.vstack(parts_v)
+    faces = np.vstack(parts_f)
+    face_colors = np.vstack(parts_c)
+    return verts, faces, face_colors
+
+
+def _load_vehicle_mesh():
+    """Return the built-in low-poly car mesh (verts + faces + per-face colors),
+    normalized to a unit half-extent in the REP-103 body frame (+x fwd, +y left,
+    +z up). Cached per process."""
+    if "mesh" in _VEHICLE_MESH_CACHE:
+        return _VEHICLE_MESH_CACHE["mesh"]
+
+    verts, faces_arr, face_colors = _stylized_vehicle_mesh()
+    verts = verts - verts.mean(axis=0)
+    scale = float(np.max(np.abs(verts)))
+    if scale > 1e-9:
+        verts = verts / scale
+
+    mesh = {"verts": verts, "faces": faces_arr, "face_colors": face_colors}
+    _VEHICLE_MESH_CACHE["mesh"] = mesh
+    return mesh
+
+
+def _camera_basis(elev_deg=22.0, azim_deg=-55.0):
+    """Fixed 3rd-person camera basis in world (REP-103) coords. Returns
+    (right, up, toward_viewer) unit vectors for an orthographic projection."""
+    el = math.radians(elev_deg)
+    az = math.radians(azim_deg)
+    cam_z = np.array([math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
+    cam_z = cam_z / max(np.linalg.norm(cam_z), 1e-9)
+    right = np.cross(np.array([0.0, 0.0, 1.0]), cam_z)
+    rn = np.linalg.norm(right)
+    right = np.array([1.0, 0.0, 0.0]) if rn < 1e-6 else right / rn
+    cam_up = np.cross(cam_z, right)
+    return right, cam_up, cam_z
+
+
+def _draw_vehicle_orientation(draw, cx, cy, size, mesh, R_body,
+                              elev_deg=24.0, azim_deg=128.0, ref_label="start"):
+    """Draw a small flat-shaded 3rd-person vehicle at (cx, cy) within a box of
+    half-width `size`, oriented by world_from_body rotation R_body, resting on a
+    fixed ground plane, with colored body axes (X=red, Y=green, Z=blue).
+
+    The camera sits behind-and-above the vehicle (chase view), so vehicle-forward
+    (+x, red axis) points *into* the screen -- a forward-driving car heads away
+    from the viewer, matching the forward-facing camera feed the HUD overlays.
+
+    A fixed arrow marks world +x on the ground: "N" (true north) when the caller
+    has a georeferenced minimap to confirm odom +x is north, else "start" (the
+    trajectory's initial heading, with R_body pre-referenced to it)."""
+    right, cam_up, cam_z = _camera_basis(elev_deg, azim_deg)
+    pix = size * 0.44
+
+    def project(pts_world):
+        pts = np.atleast_2d(np.asarray(pts_world, dtype=np.float64))
+        sx = pts @ right
+        sy = pts @ cam_up
+        depth = pts @ cam_z
+        px = cx + sx * pix
+        py = cy - sy * pix
+        return px, py, depth
+
+    verts = mesh["verts"]
+    faces = mesh["faces"]
+    verts_w = verts @ np.asarray(R_body, dtype=np.float64).T
+
+    # --- Ground plane at the vehicle's lowest point (world-horizontal) ---
+    ground_z = float(verts_w[:, 2].min())
+    ext = 1.7
+    n_grid = 4
+    plane_fill = (70, 90, 120, 90)
+    grid_col = (150, 170, 200, 110)
+    corners = np.array([
+        [-ext, -ext, ground_z], [ext, -ext, ground_z],
+        [ext, ext, ground_z], [-ext, ext, ground_z],
+    ])
+    cpx, cpy, _ = project(corners)
+    draw.polygon(list(zip(cpx, cpy)), fill=plane_fill)
+    for i in range(n_grid + 1):
+        t = -ext + 2 * ext * i / n_grid
+        ax0, ay0, _ = project([[t, -ext, ground_z]])
+        ax1, ay1, _ = project([[t, ext, ground_z]])
+        draw.line([ax0[0], ay0[0], ax1[0], ay1[0]], fill=grid_col, width=1)
+        bx0, by0, _ = project([[-ext, t, ground_z]])
+        bx1, by1, _ = project([[ext, t, ground_z]])
+        draw.line([bx0[0], by0[0], bx1[0], by1[0]], fill=grid_col, width=1)
+
+    # Fixed reference arrow on the ground at world +x (true north if ref_label is
+    # "N", else the trajectory's start heading). The plane/arrow don't move, so
+    # the car visibly turns against them.
+    ref_col = (255, 210, 90, 200) if ref_label == "N" else (110, 195, 255, 165)
+    rx0, ry0, _ = project([[0.15, 0.0, ground_z]])
+    rx1, ry1, _ = project([[1.55, 0.0, ground_z]])
+    draw.line([rx0[0], ry0[0], rx1[0], ry1[0]], fill=ref_col, width=2)
+    hxl, hyl, _ = project([[1.2, 0.2, ground_z]])
+    hxr, hyr, _ = project([[1.2, -0.2, ground_z]])
+    draw.polygon([(rx1[0], ry1[0]), (hxl[0], hyl[0]), (hxr[0], hyr[0])], fill=ref_col)
+    lx, ly, _ = project([[1.55, 0.0, ground_z]])
+    draw.text((lx[0] - 16, ly[0]), ref_label, fill=ref_col, anchor="mm")
+
+    # --- Vehicle: depth-sorted painter's fill with per-face color + Lambert shading ---
+    px, py, depth = project(verts_w)
+    light = np.array([-0.35, -0.45, 0.82])
+    light = light / np.linalg.norm(light)
+    v0 = verts_w[faces[:, 0]]
+    v1 = verts_w[faces[:, 1]]
+    v2 = verts_w[faces[:, 2]]
+    normals = np.cross(v1 - v0, v2 - v0)
+    nnorm = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = normals / np.clip(nnorm, 1e-9, None)
+    inten = np.abs(normals @ light)
+    ambient = 0.45
+    shade = ambient + (1.0 - ambient) * inten
+    face_colors = mesh.get("face_colors")
+    base = np.array([200.0, 206.0, 214.0])
+    edge = (24, 26, 32, 200)
+    face_depth = depth[faces].mean(axis=1)
+    order = np.argsort(face_depth)  # far (smaller depth) first
+    for fi in order:
+        tri = faces[fi]
+        c = base if face_colors is None else face_colors[fi]
+        col = tuple(int(x) for x in np.clip(c * shade[fi], 0, 255)) + (240,)
+        draw.polygon([(px[tri[0]], py[tri[0]]),
+                      (px[tri[1]], py[tri[1]]),
+                      (px[tri[2]], py[tri[2]])], fill=col, outline=edge)
+
+    # --- Colored body axes from the vehicle origin ---
+    ox, oy, _ = project([[0.0, 0.0, 0.0]])
+    axis_len = 1.35
+    axes = [
+        (np.array([axis_len, 0.0, 0.0]), (255, 80, 80, 255)),   # X forward - red
+        (np.array([0.0, axis_len, 0.0]), (90, 230, 110, 255)),  # Y left - green
+        (np.array([0.0, 0.0, axis_len]), (90, 160, 255, 255)),  # Z up - blue
     ]
-    for text, pos, anchor, color in labels:
-        draw.text(pos, text, font=font_label, fill=color, anchor=anchor)
+    for vec, color in axes:
+        ex, ey, _ = project([R_body @ vec])
+        draw.line([ox[0], oy[0], ex[0], ey[0]], fill=color, width=2)
+        draw.ellipse([ex[0] - 2.5, ey[0] - 2.5, ex[0] + 2.5, ey[0] + 2.5], fill=color)
 
 
 def _draw_polyline(draw, points, fill, width=2):
@@ -361,9 +602,12 @@ def render_overlay_frame(args_tuple):
         frame_idx,
         speed_mps,
         wall_time_str,
-        frame_ax_g,
-        frame_ay_g,
+        trail_ax_g,
+        trail_ay_g,
         gmeter_max_g,
+        R_body,
+        vehicle_mesh,
+        ref_label,
         map_background,
         route_px,
         frame_px,
@@ -420,7 +664,7 @@ def render_overlay_frame(args_tuple):
 
     img.alpha_composite(minimap, dest=(map_x, map_y))
 
-    # --- Bottom-right: Info panel (time + speed + g-meter) ---
+    # --- Bottom-right: Info panel (time + speed + g-meter + orientation) ---
     gm_radius = 38
     gm_diameter = 2 * gm_radius
     gm_label_w_side = 36
@@ -429,13 +673,24 @@ def render_overlay_frame(args_tuple):
     gmeter_block_w = gm_diameter + 2 * gm_label_w_side
     gmeter_block_h = gm_diameter + 2 * gm_label_h_vert
 
-    has_imu = np.isfinite(frame_ax_g) and np.isfinite(frame_ay_g)
+    trail_ax_g = np.atleast_1d(np.asarray(trail_ax_g, dtype=np.float64))
+    trail_ay_g = np.atleast_1d(np.asarray(trail_ay_g, dtype=np.float64))
+    has_imu = (
+        len(trail_ax_g) and len(trail_ay_g)
+        and np.isfinite(trail_ax_g[-1]) and np.isfinite(trail_ay_g[-1])
+    )
+    has_orient = R_body is not None and vehicle_mesh is not None
+    orient_size = 46
+    orient_block_h = 2 * orient_size + 6
+
     text_block_w = 200
     inner_h = 20 + 4 + 32  # time + gap + speed
     if has_imu:
         inner_h += 8 + gmeter_block_h
+    if has_orient:
+        inner_h += 8 + orient_block_h
 
-    info_panel_w = max(text_block_w, gmeter_block_w) + 2 * panel_pad
+    info_panel_w = max(text_block_w, gmeter_block_w, 2 * orient_size) + 2 * panel_pad
     info_panel_h = inner_h + 2 * panel_pad
     info_panel_x = canvas_w - info_panel_w - margin
     info_panel_y = canvas_h - info_panel_h - margin
@@ -459,7 +714,15 @@ def render_overlay_frame(args_tuple):
         cy += 8
         gm_cx = info_panel_x + info_panel_w / 2
         gm_cy = cy + gm_label_h_vert + gm_radius
-        _draw_gmeter(draw, gm_cx, gm_cy, gm_radius, frame_ax_g, frame_ay_g, gmeter_max_g, font_label)
+        _draw_gmeter(draw, gm_cx, gm_cy, gm_radius, trail_ax_g, trail_ay_g, gmeter_max_g, font_label)
+        cy += gmeter_block_h
+
+    if has_orient:
+        cy += 8
+        ov_cx = info_panel_x + info_panel_w / 2
+        ov_cy = cy + orient_size
+        _draw_vehicle_orientation(draw, ov_cx, ov_cy, orient_size, vehicle_mesh, R_body,
+                                  ref_label=ref_label)
 
     img.save(out_path)
     return out_path
@@ -482,6 +745,10 @@ def render_overlay_frames_parallel(
     accel_xy=None,
     accel_times=None,
     gmeter_max_g=1.0,
+    gmeter_trail=15,
+    quat_xyzw=None,
+    quat_times=None,
+    orient_cfg=None,
 ):
     frame_ts = np.asarray(frame_ts, dtype=np.float64)
     gps_xy = np.asarray(gps_xy, dtype=np.float64)
@@ -497,7 +764,7 @@ def render_overlay_frames_parallel(
         frame_x = np.interp(frame_ts, gps_times, gps_xy[:, 0])
         frame_y = np.interp(frame_ts, gps_times, gps_xy[:, 1])
         frame_xy = np.column_stack([frame_x, frame_y])
-        bg, route_px, frame_px = _load_minimap_background(
+        bg, route_px, frame_px, north_available = _load_minimap_background(
             gps_xy,
             map_tif=map_tif,
             map_source=map_source,
@@ -511,6 +778,7 @@ def render_overlay_frames_parallel(
         bg = Image.new("RGBA", (map_w, map_h), (26, 26, 46, 235))
         route_px = np.zeros((0, 2), dtype=np.float64)
         frame_px = None
+        north_available = False
 
     if len(speed_mps) >= 1 and len(speed_times) >= 1:
         frame_speed = np.interp(frame_ts, speed_times, speed_mps)
@@ -530,6 +798,40 @@ def render_overlay_frames_parallel(
         frame_ax_g = np.full(len(frame_ts), np.nan)
         frame_ay_g = np.full(len(frame_ts), np.nan)
 
+    # Per-frame vehicle orientation (world_from_body rotation matrices) + mesh.
+    orient_cfg = orient_cfg or {}
+    orient_enabled = orient_cfg.get("enabled", True)
+    has_orient = (
+        orient_enabled
+        and quat_xyzw is not None and len(quat_xyzw) >= 1
+        and quat_times is not None and len(quat_times) >= 1
+    )
+    frame_R = None
+    vehicle_mesh = None
+    ref_label = "start"
+    if has_orient:
+        from scipy.spatial.transform import Rotation as R
+        quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64).reshape(-1, 4)
+        quat_times = np.asarray(quat_times, dtype=np.float64)
+        # nlerp: component-wise interpolate then renormalize (fine for small steps).
+        fq = np.column_stack([
+            np.interp(frame_ts, quat_times, quat_xyzw[:, k]) for k in range(4)
+        ])
+        norms = np.linalg.norm(fq, axis=1, keepdims=True)
+        fq = fq / np.clip(norms, 1e-9, None)
+        frame_R = R.from_quat(fq).as_matrix()  # (N, 3, 3)
+        if north_available:
+            # GeoTIFF minimap resolved -> gps_xy
+            ref_label = "N"
+        else:
+            # No north reference: treat the trajectory's starting heading as forward.
+            yaw0 = math.atan2(frame_R[0][1, 0], frame_R[0][0, 0])
+            c0, s0 = math.cos(-yaw0), math.sin(-yaw0)
+            Rz0 = np.array([[c0, -s0, 0.0], [s0, c0, 0.0], [0.0, 0.0, 1.0]])
+            frame_R = Rz0 @ frame_R
+            ref_label = "start"
+        vehicle_mesh = _load_vehicle_mesh()
+
     if not np.isfinite(bag_start_time):
         bag_start_time = frame_ts[0]
     wall_times = bag_start_time + (frame_ts - frame_ts[0])
@@ -538,15 +840,20 @@ def render_overlay_frames_parallel(
         for t in wall_times
     ]
 
+    trail = max(1, int(gmeter_trail))
     jobs = []
     for idx in range(len(frame_ts)):
+        lo = max(0, idx - trail + 1)
         jobs.append((
             idx,
             float(frame_speed[idx]),
             wall_time_strs[idx],
-            float(frame_ax_g[idx]),
-            float(frame_ay_g[idx]),
+            frame_ax_g[lo:idx + 1].copy(),
+            frame_ay_g[lo:idx + 1].copy(),
             gmeter_max_g,
+            frame_R[idx] if frame_R is not None else None,
+            vehicle_mesh,
+            ref_label,
             bg,
             route_px,
             frame_px,
@@ -585,11 +892,16 @@ def render_kitti_video_with_hud(
     accel_xy=None,
     accel_times=None,
     gmeter_max_g=1.0,
+    gmeter_trail=15,
+    quat_xyzw=None,
+    quat_times=None,
+    orient_cfg=None,
     pip=None,
 ):
     """
-    Render an existing KITTI image directory with timestamp/speed/minimap HUD
-    and optional picture-in-picture insets (see `render_kitti_video`).
+    Render an existing KITTI image directory with timestamp/speed/minimap HUD,
+    a g-meter, a 3D vehicle-orientation widget, and optional picture-in-picture
+    insets (see `render_kitti_video`).
     """
     def _render_without_hud():
         return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
@@ -646,6 +958,10 @@ def render_kitti_video_with_hud(
         accel_xy=accel_xy,
         accel_times=accel_times,
         gmeter_max_g=gmeter_max_g,
+        gmeter_trail=gmeter_trail,
+        quat_xyzw=quat_xyzw,
+        quat_times=quat_times,
+        orient_cfg=orient_cfg,
     )
     rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir, pip=pip)
     if rendered and cleanup_overlay_dir and os.path.isdir(overlay_dir):
@@ -999,6 +1315,10 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
                 accel_xy=imu_data["accel_xy"] if imu_data is not None else None,
                 accel_times=imu_data["times"] if imu_data is not None else None,
                 gmeter_max_g=hud["gmeter_max_g"],
+                gmeter_trail=hud["gmeter_trail"],
+                quat_xyzw=hud_data.get("quat_xyzw"),
+                quat_times=hud_data.get("quat_times"),
+                orient_cfg=hud["orient"],
                 pip=pip,
             )
         else:
