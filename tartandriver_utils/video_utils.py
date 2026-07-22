@@ -26,8 +26,8 @@ def load_video_config(path):
     hud_cfg = cfg.get("hud")
     if hud_cfg and hud_cfg.get("enabled", True):
         hud = {
-            "odom_topic": hud_cfg.get("odom_topic", "/odometry/filtered_odom"),
-            "imu_topic": hud_cfg.get("imu_topic", "/novatel/imu/data"),
+            "odom_kitti_dir": hud_cfg.get("odom_kitti_dir", "sensors/novatel_gps_odom"),
+            "imu_kitti_dir": hud_cfg.get("imu_kitti_dir", "sensors/novatel_imu"),
             "gmeter_max_g": hud_cfg.get("gmeter_max_g", 1.0),
             "map_tif": hud_cfg.get("map_tif"),
             "map_source": hud_cfg.get("map_source", "auto"),
@@ -36,6 +36,60 @@ def load_video_config(path):
         }
 
     return {"hud": hud, "pip": cfg.get("pip", []) or []}
+
+
+def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom"):
+    """
+    Collect meter-frame odometry and speed for HUD overlays
+    """
+    base_dir = os.path.join(dataset_dir, odom_dir)
+    data_fp = os.path.join(base_dir, "data.txt")
+    ts_fp = os.path.join(base_dir, "timestamps.txt")
+
+    if not (os.path.exists(data_fp) and os.path.exists(ts_fp)):
+        print(f"  [hud] odom dir not found: {base_dir}; rendering timestamp-only HUD")
+        return {
+            "gps_xy": np.zeros((0, 2), dtype=np.float64),
+            "gps_times": np.zeros((0,), dtype=np.float64),
+            "speed_mps": np.zeros((0,), dtype=np.float64),
+            "speed_times": np.zeros((0,), dtype=np.float64),
+            "bag_start_time": np.nan,
+        }
+
+    data = np.loadtxt(data_fp).reshape(-1, 13)
+    times = np.atleast_1d(np.loadtxt(ts_fp)).astype(np.float64)
+
+    return {
+        "gps_xy": data[:, :2],
+        "gps_times": times,
+        "speed_mps": np.linalg.norm(data[:, 7:10], axis=1),
+        "speed_times": times,
+        "bag_start_time": np.nan,
+    }
+
+
+def collect_video_hud_imu(dataset_dir, imu_dir="sensors/novatel_imu"):
+    """
+    Collect body-frame linear acceleration (x, y) for the HUD g-meter
+    """
+    base_dir = os.path.join(dataset_dir, imu_dir)
+    data_fp = os.path.join(base_dir, "data.txt")
+    ts_fp = os.path.join(base_dir, "timestamps.txt")
+
+    if not (os.path.exists(data_fp) and os.path.exists(ts_fp)):
+        print(f"  [hud] imu dir not found: {base_dir}; g-meter HUD disabled")
+        return {
+            "accel_xy": np.zeros((0, 2), dtype=np.float64),
+            "times": np.zeros((0,), dtype=np.float64),
+        }
+
+    data = np.loadtxt(data_fp).reshape(-1, 10)
+    times = np.atleast_1d(np.loadtxt(ts_fp)).astype(np.float64)
+
+    return {
+        "accel_xy": data[:, 7:9],
+        "times": times,
+    }
 
 
 def _as_map_size(map_size):
@@ -537,9 +591,12 @@ def render_kitti_video_with_hud(
     Render an existing KITTI image directory with timestamp/speed/minimap HUD
     and optional picture-in-picture insets (see `render_kitti_video`).
     """
+    def _render_without_hud():
+        return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
+
     pngs = sorted(glob.glob(os.path.join(frames_dir, "????????.png")))
     if not pngs:
-        return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
+        return _render_without_hud()
 
     timestamps_fp = os.path.join(frames_dir, "timestamps.txt")
     if os.path.exists(timestamps_fp):
@@ -555,7 +612,7 @@ def render_kitti_video_with_hud(
             f"  [overlay] timestamp count mismatch for {frames_dir} "
             f"({len(frame_ts)} timestamps for {len(pngs)} frames); rendering without HUD."
         )
-        return render_kitti_video(frames_dir, output_path=output_path, fps=fps, pip=pip)
+        return _render_without_hud()
 
     with Image.open(pngs[0]) as img:
         canvas_size = img.size
@@ -736,10 +793,29 @@ def _build_pip_filter(specs, input_offset, base_label):
     return ";".join(segments), cur
 
 
+def _pip_variant_path(output_path):
+    """`foo.mp4` -> `foo_pip.mp4`."""
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_pip{ext}"
+
+
 def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None, pip=None):
     """
     Render a directory of PNG frames into an MP4 with an optional RGBA HUD
-    overlay and optional picture-in-picture insets.
+    overlay.
+    """
+    rendered = _render_kitti_video_once(frames_dir, output_path=output_path, fps=fps,
+                                        overlay_dir=overlay_dir, pip=None)
+    if pip:
+        _render_kitti_video_once(frames_dir, output_path=_pip_variant_path(output_path or frames_dir.rstrip(os.sep) + ".mp4"),
+                                 fps=fps, overlay_dir=overlay_dir, pip=pip)
+    return rendered
+
+
+def _render_kitti_video_once(frames_dir, output_path=None, fps=None, overlay_dir=None, pip=None):
+    """
+    Render a directory of PNG frames into a single MP4 with an optional RGBA
+    HUD overlay and optional picture-in-picture insets baked in.
     """
 
     pngs = sorted(glob.glob(os.path.join(frames_dir, "????????.png")))
@@ -862,3 +938,73 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
     finally:
         if pip_tmp_root and os.path.isdir(pip_tmp_root):
             shutil.rmtree(pip_tmp_root, ignore_errors=True)
+
+
+def discover_kitti_image_dirs(dataset_dir):
+    modality_dirs = {}
+    if not os.path.isdir(dataset_dir):
+        return modality_dirs
+
+    for group in sorted(os.listdir(dataset_dir)):
+        group_dir = os.path.join(dataset_dir, group)
+        if not os.path.isdir(group_dir):
+            continue
+        for name in sorted(os.listdir(group_dir)):
+            name_dir = os.path.join(group_dir, name)
+            if os.path.isdir(name_dir) and glob.glob(os.path.join(name_dir, "????????.png")):
+                modality_dirs[f"{group}/{name}"] = name_dir
+
+    return modality_dirs
+
+
+def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, imu_data=None):
+    os.makedirs(viz_dir, exist_ok=True)
+    hud = video_config["hud"]
+
+    pip_by_main = {}
+    for spec in video_config["pip"]:
+        inset_key = spec["inset"]
+        if inset_key not in modality_dirs:
+            print(f"  [pip] inset modality '{inset_key}' not in dataset; skipping")
+            continue
+        pip_by_main.setdefault(spec["main"], []).append({
+            "dir": modality_dirs[inset_key],
+            "scale": spec.get("scale", 0.25),
+            "pos": spec.get("pos", "bottom-right"),
+            "margin": spec.get("margin", 16),
+            "border": spec.get("border", 3),
+            "border_color": spec.get("border_color", "white"),
+        })
+
+    rendered = {}
+    for key, frames_dir in modality_dirs.items():
+        group, name = key.split("/", 1)
+        output_path = os.path.join(viz_dir, f"{group}_{name}.mp4")
+        pip = pip_by_main.get(key)
+
+        if hud is not None and hud_data is not None:
+            v = render_kitti_video_with_hud(
+                frames_dir,
+                output_path=output_path,
+                gps_xy=hud_data["gps_xy"],
+                gps_times=hud_data["gps_times"],
+                speed_mps=hud_data["speed_mps"],
+                speed_times=hud_data["speed_times"],
+                bag_start_time=hud_data["bag_start_time"],
+                overlay_root=os.path.join(viz_dir, "overlays"),
+                map_tif=hud["map_tif"],
+                map_source=hud["map_source"],
+                allow_network_tiles=hud["allow_network_tiles"],
+                n_workers=hud["workers"],
+                accel_xy=imu_data["accel_xy"] if imu_data is not None else None,
+                accel_times=imu_data["times"] if imu_data is not None else None,
+                gmeter_max_g=hud["gmeter_max_g"],
+                pip=pip,
+            )
+        else:
+            v = render_kitti_video(frames_dir, output_path=output_path, pip=pip)
+
+        if v:
+            rendered[key] = v
+
+    return rendered

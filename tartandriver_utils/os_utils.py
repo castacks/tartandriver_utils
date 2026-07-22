@@ -80,19 +80,24 @@ def save_yaml(config, fp):
     with open(fp, 'w') as fh:
         yaml.dump(config, fh, default_flow_style=False)
 
+def is_rosbag_dir_filenames(filenames):
+    """
+    Determine if a list of filenames (as in a single dir) looks like a valid
+    rosbag dir (has metadata.yaml and at least one .mcap).
+    """
+    has_metadata = "metadata.yaml" in filenames
+    has_mcaps = any([f[-5:] == ".mcap" for f in filenames])
+
+    return has_metadata and has_mcaps
+
 def is_rosbag_dir(fp):
     """
     Determine if a dir is a valid rosbag (check for mcaps and metadata.yaml)
     """
     if not os.path.isdir(fp):
         return False
-    
-    dir_files = os.listdir(fp)
 
-    has_metadata = "metadata.yaml" in dir_files
-    has_mcaps = any([df[-5:] == ".mcap" for df in dir_files])
-
-    return has_metadata and has_mcaps
+    return is_rosbag_dir_filenames(os.listdir(fp))
 
 def is_kitti_dir(fp):
     """
