@@ -76,8 +76,6 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom",
         "speed_times": np.zeros((0,), dtype=np.float64),
         "quat_xyzw": np.zeros((0, 4), dtype=np.float64),
         "quat_times": np.zeros((0,), dtype=np.float64),
-        "vel_xy": np.zeros((0, 2), dtype=np.float64),
-        "vel_times": np.zeros((0,), dtype=np.float64),
         "bag_start_time": np.nan,
     }
 
@@ -106,8 +104,6 @@ def collect_video_hud_odom(dataset_dir, odom_dir="sensors/novatel_gps_odom",
         "speed_times": times,
         "quat_xyzw": data[:, 3:7],  # (x, y, z, w) vehicle orientation
         "quat_times": times,
-        "vel_xy": data[:, 7:9],  # world-frame vx, vy -- for the minimap heading arrow
-        "vel_times": times,
         "bag_start_time": np.nan,
     }
 
@@ -788,9 +784,6 @@ def render_overlay_frames_parallel(
     quat_xyzw=None,
     quat_times=None,
     orient_cfg=None,
-    vel_xy=None,
-    vel_times=None,
-    heading_min_speed=0.15,
 ):
     frame_ts = np.asarray(frame_ts, dtype=np.float64)
     gps_xy = np.asarray(gps_xy, dtype=np.float64)
@@ -803,33 +796,34 @@ def render_overlay_frames_parallel(
 
     os.makedirs(overlay_dir, exist_ok=True)
 
-    # Heading arrow direction: derived from the *velocity vector* (already smooth
-    # -- it's a per-sample RBState field, not something we differentiate ourselves)
-    # rather than differencing consecutive rendered-frame positions. At low speed a
-    # few-frame position delta is sub-pixel on the minimap, so that approach was
-    # noise-dominated and the arrow would swing wildly frame to frame.
-    has_vel = (
-        vel_xy is not None and len(vel_xy) >= 2
-        and vel_times is not None and len(vel_times) >= 2
+    # Per-frame vehicle orientation (world_from_body rotation matrices)
+    orient_cfg = orient_cfg or {}
+    orient_enabled = orient_cfg.get("enabled", True)
+    has_orient = (
+        orient_enabled
+        and quat_xyzw is not None and len(quat_xyzw) >= 1
+        and quat_times is not None and len(quat_times) >= 1
     )
-    heading_world_dir = None
-    if has_vel:
-        vel_xy = np.asarray(vel_xy, dtype=np.float64)
-        vel_times = np.asarray(vel_times, dtype=np.float64)
-        frame_vx = np.interp(frame_ts, vel_times, vel_xy[:, 0])
-        frame_vy = np.interp(frame_ts, vel_times, vel_xy[:, 1])
-        frame_vspeed = np.hypot(frame_vx, frame_vy)
-        heading_world_dir = np.column_stack([frame_vx, frame_vy]) / np.clip(frame_vspeed, 1e-9, None)[:, None]
-        heading_world_dir[frame_vspeed < heading_min_speed] = np.nan
+    frame_R_world = None  # world_from_body, un-referenced -- true world heading
+    heading_world_dir = None  # world-frame xy of the body's forward (+x) axis
+    if has_orient:
+        from scipy.spatial.transform import Rotation as R
+        quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64).reshape(-1, 4)
+        quat_times = np.asarray(quat_times, dtype=np.float64)
+        # nlerp: component-wise interpolate then renormalize (fine for small steps).
+        fq = np.column_stack([
+            np.interp(frame_ts, quat_times, quat_xyzw[:, k]) for k in range(4)
+        ])
+        norms = np.linalg.norm(fq, axis=1, keepdims=True)
+        fq = fq / np.clip(norms, 1e-9, None)
+        frame_R_world = R.from_quat(fq).as_matrix()  # (N, 3, 3)
+        heading_world_dir = frame_R_world[:, :2, 0].copy()
 
     if len(gps_xy) >= 2 and len(gps_times) >= 2:
         frame_x = np.interp(frame_ts, gps_times, gps_xy[:, 0])
         frame_y = np.interp(frame_ts, gps_times, gps_xy[:, 1])
         frame_xy = np.column_stack([frame_x, frame_y])
 
-        # Project a small lookahead point alongside each frame position so the
-        # heading arrow comes out in whatever pixel space the minimap ends up
-        # using (track view or GeoTIFF), instead of assuming a meter->pixel scale.
         lookahead_xy = frame_xy.copy()
         if heading_world_dir is not None:
             finite = np.isfinite(heading_world_dir).all(axis=1)
@@ -881,39 +875,18 @@ def render_overlay_frames_parallel(
         frame_ax_g = np.full(len(frame_ts), np.nan)
         frame_ay_g = np.full(len(frame_ts), np.nan)
 
-    # Per-frame vehicle orientation (world_from_body rotation matrices) + mesh.
-    orient_cfg = orient_cfg or {}
-    orient_enabled = orient_cfg.get("enabled", True)
-    has_orient = (
-        orient_enabled
-        and quat_xyzw is not None and len(quat_xyzw) >= 1
-        and quat_times is not None and len(quat_times) >= 1
-    )
-    frame_R = None
-    vehicle_mesh = None
+    frame_R = frame_R_world
+    vehicle_mesh = _load_vehicle_mesh() if has_orient else None
     ref_label = "start"
     if has_orient:
-        from scipy.spatial.transform import Rotation as R
-        quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64).reshape(-1, 4)
-        quat_times = np.asarray(quat_times, dtype=np.float64)
-        # nlerp: component-wise interpolate then renormalize (fine for small steps).
-        fq = np.column_stack([
-            np.interp(frame_ts, quat_times, quat_xyzw[:, k]) for k in range(4)
-        ])
-        norms = np.linalg.norm(fq, axis=1, keepdims=True)
-        fq = fq / np.clip(norms, 1e-9, None)
-        frame_R = R.from_quat(fq).as_matrix()  # (N, 3, 3)
         if north_available:
-            # GeoTIFF minimap resolved -> gps_xy
             ref_label = "N"
         else:
-            # No north reference: treat the trajectory's starting heading as forward.
-            yaw0 = math.atan2(frame_R[0][1, 0], frame_R[0][0, 0])
+            yaw0 = math.atan2(frame_R_world[0][1, 0], frame_R_world[0][0, 0])
             c0, s0 = math.cos(-yaw0), math.sin(-yaw0)
             Rz0 = np.array([[c0, -s0, 0.0], [s0, c0, 0.0], [0.0, 0.0, 1.0]])
-            frame_R = Rz0 @ frame_R
+            frame_R = Rz0 @ frame_R_world
             ref_label = "start"
-        vehicle_mesh = _load_vehicle_mesh()
 
     if not np.isfinite(bag_start_time):
         bag_start_time = frame_ts[0]
@@ -980,8 +953,6 @@ def render_kitti_video_with_hud(
     quat_xyzw=None,
     quat_times=None,
     orient_cfg=None,
-    vel_xy=None,
-    vel_times=None,
     pip=None,
 ):
     """
@@ -1048,8 +1019,6 @@ def render_kitti_video_with_hud(
         quat_xyzw=quat_xyzw,
         quat_times=quat_times,
         orient_cfg=orient_cfg,
-        vel_xy=vel_xy,
-        vel_times=vel_times,
     )
     rendered = render_kitti_video(frames_dir, output_path=output_path, fps=fps, overlay_dir=overlay_dir, pip=pip)
     if rendered and cleanup_overlay_dir and os.path.isdir(overlay_dir):
@@ -1407,8 +1376,6 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
                 quat_xyzw=hud_data.get("quat_xyzw"),
                 quat_times=hud_data.get("quat_times"),
                 orient_cfg=hud["orient"],
-                vel_xy=hud_data.get("vel_xy"),
-                vel_times=hud_data.get("vel_times"),
                 pip=pip,
             )
         else:
