@@ -112,6 +112,37 @@ def is_kitti_dir(fp):
 
     return has_timestamps
 
+def available_cpus():
+    """
+    CPUs this process may actually use, honouring the cgroup CPU limit.
+    """
+    quota = None
+    try:  # cgroup v2
+        with open('/sys/fs/cgroup/cpu.max') as f:
+            raw, period = f.read().split()
+            if raw != 'max':
+                quota = int(raw) / int(period)
+    except (OSError, ValueError):
+        try:  # cgroup v1
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') as f:
+                raw = int(f.read())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as f:
+                period = int(f.read())
+            if raw > 0 and period > 0:
+                quota = raw / period
+        except (OSError, ValueError):
+            pass
+
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        affinity = os.cpu_count() or 1
+
+    if quota is None:
+        return affinity
+    return max(1, min(affinity, int(quota)))
+
+
 def kitti_n_frames(dir):
     """
     Get the number of frames in a KITTI dataset
