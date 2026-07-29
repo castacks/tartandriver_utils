@@ -82,7 +82,8 @@ class AngularCoverageViz(Node):
         return flat.reshape(ny, nx).T[::-1, ::-1].copy()
 
     def grid_callback(self, msg):
-        for key in ("angle_bits", "known"):
+        angle_keys = [f"angle_bin_{k}" for k in range(self.n_bins)]
+        for key in angle_keys + ["known"]:
             if key not in msg.layers:
                 self.get_logger().warn(f"GridMap missing expected layer '{key}'")
                 return
@@ -94,13 +95,14 @@ class AngularCoverageViz(Node):
                            msg.info.pose.position.y - 0.5 * ly])
         resolution = np.array([res, res])
 
-        bits = self._decode_layer(msg, "angle_bits", nx, ny)
+        counts = np.stack([self._decode_layer(msg, k, nx, ny) for k in angle_keys], axis=-1)
         known = self._decode_layer(msg, "known", nx, ny) > 0
-        self.latest = (bits, known, origin, resolution)
+        self.latest = (counts, known, origin, resolution)
         self.count += 1
         self.dirty = True
         self.get_logger().info(
-            f"msg #{self.count}: {int(known.sum())} observed cells", throttle_duration_sec=1.0
+            f"msg #{self.count}: {int(known.sum())} observed cells, "
+            f"max hits/bin {int(counts.max())}", throttle_duration_sec=1.0
         )
 
     def gps_callback(self, msg):
@@ -113,8 +115,8 @@ class AngularCoverageViz(Node):
     def timer_callback(self):
         plt.show(block=False)  # start / keep the GUI up (non-blocking)
         if self.dirty and self.latest is not None:
-            bits, known, origin, resolution = self.latest
-            self.viz.render(bits, known, origin, resolution, self.n_bins, vehicle_en=self.veh_en)
+            counts, known, origin, resolution = self.latest
+            self.viz.render(counts, known, origin, resolution, self.n_bins, vehicle_en=self.veh_en)
             self.viz.ax.set_title(f"angular coverage - {int(known.sum())} cells, {self.count} msgs")
             self.dirty = False
         plt.pause(1e-2)        # service the matplotlib event loop on the main thread
@@ -124,7 +126,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tif", required=False, help="satellite GeoTIFF (same CRS as the grid)")
     ap.add_argument("--topic", default="/angular_coverage", help="coverage GridMap topic")
-    ap.add_argument("--n-bins", type=int, default=8, help="number of angle bins")
+    ap.add_argument("--n-bins", type=int, default=16, help="number of angle bins")
     ap.add_argument("--gps-topic", default="/rtk_gps/ekf/odometry_earth",
                     help="Odometry topic with the vehicle position (centers the zoom window)")
     ap.add_argument("--gps-crs", default="EPSG:4978",
