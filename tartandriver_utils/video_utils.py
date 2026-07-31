@@ -38,7 +38,7 @@ def load_video_config(path):
             "workers": hud_cfg.get("workers"),
         }
 
-    return {"hud": hud, "pip": cfg.get("pip", []) or []}
+    return {"hud": hud, "pip": cfg.get("pip", []) or [], "topics": cfg.get("topics", []) or []}
 
 
 def _load_interp_rbstate(dataset_dir, sub_dir):
@@ -1335,11 +1335,14 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
     hud = video_config["hud"]
 
     pip_by_main = {}
+    render_keys = set(video_config.get("topics", []))
     for spec in video_config["pip"]:
+        render_keys.add(spec["main"])
         inset_key = spec["inset"]
         if inset_key not in modality_dirs:
             print(f"  [pip] inset modality '{inset_key}' not in dataset; skipping")
             continue
+        render_keys.add(inset_key)
         pip_by_main.setdefault(spec["main"], []).append({
             "dir": modality_dirs[inset_key],
             "scale": spec.get("scale", 0.25),
@@ -1350,7 +1353,11 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
         })
 
     rendered = {}
-    for key, frames_dir in modality_dirs.items():
+    for key in sorted(render_keys):
+        if key not in modality_dirs:
+            print(f"  [video] modality '{key}' not in dataset; skipping")
+            continue
+        frames_dir = modality_dirs[key]
         group, name = key.split("/", 1)
         output_path = os.path.join(viz_dir, f"{group}_{name}.mp4")
         pip = pip_by_main.get(key)
