@@ -50,7 +50,6 @@ class YamlLoader(yaml.SafeLoader):
         super(YamlLoader, self).add_constructor('!listcat', YamlLoader.listcat)
 
     def include(self, node):
-
         filename = os.path.join(self._root, self.construct_scalar(node))
 
         with open(filename, "r") as f:
@@ -58,23 +57,35 @@ class YamlLoader(yaml.SafeLoader):
         stream = io.StringIO(content)
         stream.name = filename
         return yaml.load(stream, YamlLoader)
-    
+
     def listcat(self, node):
         out = []
         #need this to work with w/ include and explicit
         value = self.construct_sequence(node, deep=True)
         for x in value:
-            out.extend(x)
+            if isinstance(x, list):
+                out.extend(x)
+            else:
+                out.append(x)
         return out
-        
-def load_yaml(fp):
+
+class IgnoreIncludeLoader(YamlLoader):
+    """
+    Not super useful, but helpful for when you want to save a "raw" config that
+    does not replace the expand the include yaml's
+    """
+    def __init__(self, stream):
+        super().__init__(stream)
+        self.add_constructor('!include', lambda loader, node: loader.construct_scalar(node))
+
+def load_yaml(fp, loader=YamlLoader):
     # identify and expand any env vars
     with open(fp,"r") as f:
        content = os.path.expandvars(f.read())
     # turn string content into stream for loader
     stream = io.StringIO(content)
     stream.name = fp
-    return yaml.load(stream, YamlLoader)
+    return yaml.load(stream, loader)
 
 def save_yaml(config, fp):
     with open(fp, 'w') as fh:
