@@ -1277,9 +1277,11 @@ def _render_kitti_video_once(frames_dir, output_path=None, fps=None, overlay_dir
         cmd.extend(["-vf", drawtext])
 
     cmd.extend([
-        "-c:v", "libx264",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "vbr",
+        "-cq", "23",
         "-pix_fmt", "yuv420p",
-        "-threads", "0",
         "-progress", "pipe:1",
         "-nostats",
         output_path,
