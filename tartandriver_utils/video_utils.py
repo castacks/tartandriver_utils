@@ -1180,8 +1180,10 @@ def render_kitti_video(frames_dir, output_path=None, fps=None, overlay_dir=None,
     rendered = _render_kitti_video_once(frames_dir, output_path=output_path, fps=fps,
                                         overlay_dir=overlay_dir, pip=None)
     if pip:
-        _render_kitti_video_once(frames_dir, output_path=_pip_variant_path(output_path or frames_dir.rstrip(os.sep) + ".mp4"),
-                                 fps=fps, overlay_dir=overlay_dir, pip=pip)
+        pip_rendered = _render_kitti_video_once(frames_dir, output_path=_pip_variant_path(output_path or frames_dir.rstrip(os.sep) + ".mp4"),
+                                                fps=fps, overlay_dir=overlay_dir, pip=pip)
+        if not pip_rendered:
+            raise RuntimeError(f"PiP video rendering failed: {frames_dir}")
     return rendered
 
 
@@ -1390,7 +1392,8 @@ def render_dataset_videos(modality_dirs, video_config, viz_dir, hud_data=None, i
         else:
             v = render_kitti_video(frames_dir, output_path=output_path, pip=pip)
 
-        if v:
-            rendered[key] = v
+        if not v:
+            raise RuntimeError(f"Video rendering failed: {frames_dir}")
+        rendered[key] = v
 
     return rendered
